@@ -1,7 +1,22 @@
 # ============================================================
-# FOMC Implied-vs-Realized Volatility Study
+# FOMC Vol Study — Two-Part Pipeline
 # Bloomberg BQuant / JupyterLab
-# Paste into one cell or split at the ── CELL BREAK ── markers
+# ── PART A: Unit Cleaning & Scale Normalisation  (run FIRST)
+# ── PART B: Implied-vs-Realized VRP Study        (run after Part A)
+# ============================================================
+#
+# Typical workflow
+# ----------------
+#   cleaning = run_cleaning_pipeline(impl_pl, rv_pl)
+#
+#   results  = run_fomc_vol_study(
+#       impl_pl     = cleaning["impl_clean"],
+#       rv_pl       = rv_pl,
+#       regime_pl   = regime_pl,
+#       px_daily_pl = cleaning.get("px_long"),
+#   )
+#
+# Split at the ── CELL BREAK ── markers to paste into separate cells.
 # ============================================================
 
 from __future__ import annotations
@@ -23,13 +38,13 @@ except ImportError:
     HAS_STATSMODELS = False
     warnings.warn("statsmodels not available; Newey-West variance computed manually.")
 
-# ── Global params (override before calling run_fomc_vol_study) ─────────────
-TAU         = 21          # forward window in trading days
-DIRECTION   = "forward"   # "forward" | "backward"
-HAC_LAGS    = TAU         # Newey-West Bartlett truncation = tau
-OUTPUT_DIR  = Path(".")
+# ── Global params ──────────────────────────────────────────────────────────
+TAU        = 21          # RV window in trading days
+DIRECTION  = "forward"   # "forward" | "backward"
+HAC_LAGS   = TAU         # Newey-West Bartlett truncation
+IV_CAP     = 40.0        # cells above this (after unit fix) are bad ticks
+OUTPUT_DIR = Path(".")
 
-# Stable colour palette — one colour per regime label (up to 10)
 _PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -37,14 +52,16 @@ _PALETTE = [
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Internal utilities
+# Shared helpers (used by both Part A and Part B)
 # ──────────────────────────────────────────────────────────────────────────
 
-def _unpivot(df: pl.DataFrame,
-             on: list[str],
-             index: str,
-             variable_name: str,
-             value_name: str) -> pl.DataFrame:
+def _unpivot(
+    df: pl.DataFrame,
+    on: list[str],
+    index: str,
+    variable_name: str,
+    value_name: str,
+) -> pl.DataFrame:
     """Polars unpivot / melt compatibility shim (handles <0.19 and ≥0.19)."""
     try:
         return df.unpivot(
@@ -68,33 +85,43 @@ def _regime_colors(regime_series: pl.Series) -> dict:
     return {lab: _PALETTE[i % len(_PALETTE)] for i, lab in enumerate(labels)}
 
 
+def _fix_date_col(df: pl.DataFrame, new_name: str) -> pl.DataFrame:
+    """Rename first column to new_name and cast to pl.Date."""
+    old = df.columns[0]
+    df  = df.rename({old: new_name})
+    if df[new_name].dtype is not pl.Date:
+        try:
+            df = df.with_columns(pl.col(new_name).cast(pl.Date))
+        except Exception:
+            df = df.with_columns(pl.col(new_name).str.to_date(strict=False))
+    return df
+
+
+# ── CELL BREAK ────────────────────────────────────────────────────────────
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 0 — INSPECT & VALIDATE
+# PART A — UNIT CLEANING & SCALE NORMALISATION
 # ══════════════════════════════════════════════════════════════════════════
 
-def inspect_and_validate(
-    impl_pl:   pl.DataFrame,
-    rv_pl:     pl.DataFrame,
-    regime_pl: pl.DataFrame,
-    tau:       int = TAU,
-) -> tuple[
-    pl.DataFrame,               # impl_pl   (cleaned)
-    pl.DataFrame,               # rv_pl     (cleaned; "fomc_date" or "date" first col)
-    pl.DataFrame,               # regime_pl (date cast)
-    Optional[pl.DataFrame],     # px_daily_pl (None if BQL re-pull needed)
-    list[str],                  # tenors
-    str,                        # regime_date_col
-    str,                        # regime_label_col
-]:
-    """
-    Print schema/shape/head/nulls; rename first columns to fomc_date; cast
-    dates; detect tenors from impl_pl; decide whether rv_pl is a usable daily
-    price panel.
 
-    Returns px_daily_pl=None and prints a BQL snippet if rv_pl has only one
-    price per FOMC meeting.
-    """
+# ── Step 0 ────────────────────────────────────────────────────────────────
 
+def inspect_raw(
+    impl_pl: pl.DataFrame,
+    rv_pl:   pl.DataFrame,
+) -> tuple[pl.DataFrame, pl.DataFrame, list[str]]:
+    """
+    Step 0: Print schema / shape / head / null counts for both frames.
+    Rename first columns to fomc_date; cast to pl.Date.
+    Cast all tenor columns to Float64 (strict=False so bad strings → null).
+
+    Returns
+    -------
+    impl_pl : first col = fomc_date (Date); tenor cols = Float64
+    rv_pl   : same
+    tenors  : tenor labels read from impl_pl (everything after fomc_date)
+    """
     def _report(name: str, df: pl.DataFrame) -> None:
         print(f"\n{'═'*60}\n  {name}   shape={df.shape}\n{'═'*60}")
         print("  Schema:")
@@ -102,97 +129,187 @@ def inspect_and_validate(
             print(f"    {col:30s}  {dtype}")
         print(f"\n  Head (3 rows):\n{df.head(3)}")
         nulls = {c: df[c].null_count() for c in df.columns if df[c].null_count()}
-        print(f"\n  Null counts: {nulls if nulls else 'none'}")
+        print(f"  Null counts: {nulls if nulls else 'none'}")
 
-    _report("impl_pl",   impl_pl)
-    _report("rv_pl",     rv_pl)
-    _report("regime_pl", regime_pl)
+    impl_pl = _fix_date_col(impl_pl, "fomc_date")
+    rv_pl   = _fix_date_col(rv_pl,   "fomc_date")
 
-    # ── tenors: all columns after the first in impl_pl ───────────────────
-    tenors: list[str] = impl_pl.columns[1:]
+    tenors: list[str] = [c for c in impl_pl.columns if c != "fomc_date"]
     print(f"\n  Detected tenors: {tenors}")
 
-    # ── rename & cast date columns ────────────────────────────────────────
-    def _fix_date(df: pl.DataFrame, new_name: str) -> pl.DataFrame:
-        old = df.columns[0]
-        df = df.rename({old: new_name})
-        if df[new_name].dtype not in (pl.Date,):
-            try:
-                df = df.with_columns(pl.col(new_name).cast(pl.Date))
-            except Exception:
-                df = df.with_columns(
-                    pl.col(new_name).str.to_date(strict=False).alias(new_name)
-                )
-        return df
-
-    impl_pl = _fix_date(impl_pl, "fomc_date")
-    rv_pl   = _fix_date(rv_pl,   "fomc_date")   # may be renamed to "date" below
-
-    # ── detect regime date / label columns ───────────────────────────────
-    def _is_date_col(df: pl.DataFrame, col: str) -> bool:
-        return df[col].dtype in (pl.Date, pl.Datetime) or "date" in col.lower()
-
-    regime_date_col  = next(
-        (c for c in regime_pl.columns if _is_date_col(regime_pl, c)),
-        regime_pl.columns[0],
+    # Cast tenor cols to Float64 — bad strings become null (strict=False)
+    impl_pl = impl_pl.with_columns(
+        [pl.col(t).cast(pl.Float64, strict=False) for t in tenors]
     )
-    regime_label_col = next(
-        (c for c in regime_pl.columns if c != regime_date_col),
-        regime_pl.columns[1],
+    rv_pl = rv_pl.with_columns(
+        [pl.col(t).cast(pl.Float64, strict=False) for t in tenors
+         if t in rv_pl.columns]
     )
-    print(f"\n  regime_date_col='{regime_date_col}'  regime_label_col='{regime_label_col}'")
 
-    if regime_pl[regime_date_col].dtype not in (pl.Date,):
-        try:
-            regime_pl = regime_pl.with_columns(
-                pl.col(regime_date_col).cast(pl.Date)
-            )
-        except Exception:
-            regime_pl = regime_pl.with_columns(
-                pl.col(regime_date_col).str.to_date(strict=False)
-            )
+    _report("impl_pl", impl_pl)
+    _report("rv_pl",   rv_pl)
 
-    # ── decide daily vs one-price-per-meeting ─────────────────────────────
-    n_rv        = rv_pl.shape[0]
-    n_fomc      = impl_pl.shape[0]
-    dates_rv    = rv_pl["fomc_date"].sort()
-    median_gap  = int(
-        dates_rv.diff().drop_nulls().cast(pl.Int64).median() or 0
-    )   # calendar days between consecutive dates
+    return impl_pl, rv_pl, tenors
 
-    is_daily = (n_rv > n_fomc * 3) or (0 < median_gap <= 7)
+
+# ── Step 1 ────────────────────────────────────────────────────────────────
+
+def clean_iv(
+    impl_pl: pl.DataFrame,
+    cap:     float = IV_CAP,
+) -> pl.DataFrame:
+    """
+    Step 1: Detect the storage unit of HIST_CALL_IMP_VOL and normalise to
+    annualised price-vol percentage points (~3–15 pp for Treasury options).
+
+    Unit detection (applied once, globally, across all tenors):
+      global_median > 100  →  divide by 100   (e.g. 750 bps → 7.50 pp)
+      global_median <   1  →  multiply by 100  (e.g. 0.075 → 7.5 pp)
+      else                 →  leave as-is      (already in pp)
+
+    Any cell still above `cap` after scaling is treated as a data error
+    (stale tick, roll artefact, etc.) and nulled.
+
+    Parameters
+    ----------
+    impl_pl : output of inspect_raw — fomc_date + tenor cols as Float64
+    cap     : ceiling for valid implied vol (pp); default 40
+
+    Returns
+    -------
+    impl_clean : same shape, tenor values in annualised pp; bad ticks nulled
+    """
+    tenors = [c for c in impl_pl.columns if c != "fomc_date"]
+
+    # Stack all tenor values to compute a single representative median
+    stacked = (
+        _unpivot(impl_pl, on=tenors, index="fomc_date",
+                 variable_name="tenor", value_name="iv")
+        ["iv"]
+        .drop_nulls()
+    )
+    raw_median = float(stacked.median())
+
+    if raw_median > 100:
+        scale   = 1 / 100
+        reason  = f"median {raw_median:.1f} > 100 → ÷100 (likely basis-points storage)"
+    elif raw_median < 1:
+        scale   = 100.0
+        reason  = f"median {raw_median:.4f} < 1 → ×100 (likely decimal storage)"
+    else:
+        scale   = 1.0
+        reason  = f"median {raw_median:.2f} already in pp range → no rescaling"
+
+    print(f"\n  [clean_iv] raw global median = {raw_median:.4f}")
+    print(f"  [clean_iv] scale factor      = {scale}  ({reason})")
+
+    impl_scaled = impl_pl.with_columns(
+        [pl.col(t) * scale for t in tenors]
+    )
+
+    # Cap: null anything above cap — count per tenor for auditability
+    suspect_counts: dict[str, int] = {}
+    for t in tenors:
+        n = int(impl_scaled.filter(pl.col(t) > cap)[t].count())
+        suspect_counts[t] = n
+
+    total_suspects = sum(suspect_counts.values())
+    if total_suspects:
+        print(f"\n  [clean_iv] cells > {cap}pp (bad ticks) per tenor:")
+        for t, n in suspect_counts.items():
+            if n:
+                print(f"    {t}: {n}")
+        print(f"  Total nulled: {total_suspects}")
+    else:
+        print(f"  [clean_iv] no cells exceed cap={cap}pp after scaling — data looks clean")
+
+    impl_clean = impl_scaled.with_columns(
+        [
+            pl.when(pl.col(t) > cap).then(None).otherwise(pl.col(t)).alias(t)
+            for t in tenors
+        ]
+    )
+
+    print(f"\n  impl_clean shape: {impl_clean.shape}")
+    print(impl_clean.head(3))
+    return impl_clean
+
+
+# ── Step 2 ────────────────────────────────────────────────────────────────
+
+def check_rv_source(
+    rv_pl:   pl.DataFrame,
+    impl_pl: pl.DataFrame,
+    tenors:  list[str],
+) -> tuple[bool, Optional[pl.DataFrame]]:
+    """
+    Step 2: Decide if rv_pl is a usable daily price panel (b) or a
+    one-price-per-FOMC-meeting stub (a).
+
+    Detection heuristic:
+      - row count > 3× number of FOMC meetings, OR
+      - median calendar gap between consecutive dates ≤ 7 days
+      → treat as daily.
+
+    Parameters
+    ----------
+    rv_pl   : from inspect_raw — fomc_date + tenor cols
+    impl_pl : from inspect_raw — used for FOMC count and date range
+    tenors  : from inspect_raw
+
+    Returns
+    -------
+    is_daily : True if rv_pl is a daily panel
+    px_long  : (date, tenor, price) sorted [tenor, date] if is_daily else None.
+               Prints a BQL re-pull snippet and returns None if not daily.
+    """
+    n_rv    = rv_pl.shape[0]
+    n_fomc  = impl_pl.shape[0]
+
+    # Cast Date → Int32 (days since epoch) for arithmetic; diff → calendar days
+    gaps     = rv_pl["fomc_date"].sort().cast(pl.Int32).diff().drop_nulls()
+    med_gap  = float(gaps.median() or 0)
+
+    is_daily = (n_rv > n_fomc * 3) or (0 < med_gap <= 7)
 
     if is_daily:
-        print(f"\n  ✓ rv_pl: {n_rv} rows, median date gap {median_gap}d "
-              "→ treating as daily price panel.")
-        rv_pl       = rv_pl.rename({"fomc_date": "date"})
-        px_daily_pl: Optional[pl.DataFrame] = rv_pl
-    else:
-        print(f"\n  ✗ rv_pl: {n_rv} rows ≈ {n_fomc} FOMC meetings "
-              f"(median gap {median_gap}d).")
-        print("  RV CANNOT be computed from one price per FOMC meeting.")
-
-        min_d = (impl_pl["fomc_date"].min() - timedelta(days=10)).strftime("%Y-%m-%d")
-        max_d = (impl_pl["fomc_date"].max() + timedelta(days=40)).strftime("%Y-%m-%d")
-
-        _bbg_map = {
-            "2Y": "TU1 Comdty", "5Y": "FV1 Comdty", "10Y": "TY1 Comdty",
-            "20Y": "US1 Comdty", "30Y": "WN1 Comdty",
-        }
-        tickers_str = ", ".join(
-            f'"{_bbg_map.get(t, t + " Comdty")}"' for t in tenors
+        print(f"\n  [check_rv_source] ✓ {n_rv} rows, median gap {med_gap:.0f}d "
+              "→ daily price panel")
+        rv_daily  = rv_pl.rename({"fomc_date": "date"})
+        wide_cols = [c for c in rv_daily.columns if c in tenors]
+        px_long   = (
+            _unpivot(rv_daily, on=wide_cols, index="date",
+                     variable_name="tenor", value_name="price")
+            .drop_nulls("price")
+            .sort(["tenor", "date"])
         )
-        tenor_map_str = "{" + ", ".join(
-            f'"{_bbg_map.get(t, t)}": "{t}"' for t in tenors
-        ) + "}"
+        print(f"  px_long: {px_long.shape}")
+        return True, px_long
 
-        print("\n" + "=" * 60)
-        print("  BQL SNIPPET — run in a new cell, then re-call run_fomc_vol_study")
-        print("  with px_daily_pl=px_daily_pl")
-        print("  NOTE: TU1/FV1/TY1/WN1 are generic front futures — flag roll dates")
-        print("  inside any 21-day forward window (coincide with expiry ~Mar/Jun/Sep/Dec).")
-        print("=" * 60)
-        print(f"""
+    # ── sparse: one price per meeting → cannot compute RV ────────────────
+    print(f"\n  [check_rv_source] ✗ {n_rv} rows ≈ {n_fomc} FOMC meetings "
+          f"(median gap {med_gap:.0f}d).")
+    print("  RV CANNOT be computed from one price per meeting.\n")
+
+    min_d = (impl_pl["fomc_date"].min() - timedelta(days=10)).strftime("%Y-%m-%d")
+    max_d = (impl_pl["fomc_date"].max() + timedelta(days=40)).strftime("%Y-%m-%d")
+
+    _bbg = {
+        "2Y": "TU1 Comdty", "5Y": "FV1 Comdty", "10Y": "TY1 Comdty",
+        "20Y": "US1 Comdty", "30Y": "WN1 Comdty",
+    }
+    tickers_str  = ", ".join(f'"{_bbg.get(t, t + " Comdty")}"' for t in tenors)
+    tenor_map_str = (
+        "{" + ", ".join(f'"{_bbg.get(t, t)}": "{t}"' for t in tenors) + "}"
+    )
+
+    print("=" * 60)
+    print("  BQL SNIPPET — run in a new cell, then re-call run_cleaning_pipeline")
+    print("  with px_daily_pl=px_daily_pl")
+    print("  NOTE: TU1/FV1/TY1/WN1 are generic front futures; flag any roll date")
+    print("  that falls inside a 21-day forward window (Mar/Jun/Sep/Dec expiries).")
+    print("=" * 60)
+    print(f"""
 import bql, polars as pl
 bq = bql.Service()
 
@@ -205,8 +322,7 @@ fields   = {{'px': bq.data.px_last(dates=date_rng, per='D', fill='prev',
 req  = bql.Request(tickers, fields)
 resp = bq.execute(req)
 
-raw = bql.combined_df(resp).reset_index()
-# raw columns: DATE, ID, px
+raw = bql.combined_df(resp).reset_index()  # columns: DATE, ID, px
 
 px_daily_pl = (
     pl.from_pandas(raw)
@@ -222,85 +338,11 @@ px_daily_pl = (
 )
 print(px_daily_pl.head())
 """)
-        print("=" * 60)
-        px_daily_pl = None
-
-    return (
-        impl_pl, rv_pl, regime_pl,
-        px_daily_pl,
-        tenors, regime_date_col, regime_label_col,
-    )
+    print("=" * 60)
+    return False, None
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# PHASE 1 — TIDY TO LONG
-# ══════════════════════════════════════════════════════════════════════════
-
-def tidy_to_long(
-    impl_pl:     pl.DataFrame,
-    px_daily_pl: pl.DataFrame,
-    tenors:      list[str],
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """
-    Unpivot implied vol (wide→long) and standardise daily price panel.
-
-    Parameters
-    ----------
-    impl_pl      : (fomc_date, *tenors) implied vols
-    px_daily_pl  : daily prices — either wide (date, *tenors)
-                   or already long (date, tenor, price)
-    tenors       : tenor labels
-
-    Returns
-    -------
-    iv_long : (fomc_date, tenor, iv)
-    px_long : (date, tenor, price) sorted [tenor, date]
-    """
-    # ── implied vol ───────────────────────────────────────────────────────
-    iv_long = (
-        _unpivot(impl_pl, on=tenors, index="fomc_date",
-                 variable_name="tenor", value_name="iv")
-        .drop_nulls("iv")
-        .sort(["tenor", "fomc_date"])
-    )
-
-    # ── daily prices ──────────────────────────────────────────────────────
-    date_col = px_daily_pl.columns[0]
-    if "tenor" in px_daily_pl.columns and "price" in px_daily_pl.columns:
-        # Already long (from BQL re-pull)
-        px_long = (
-            px_daily_pl
-            .rename({date_col: "date"})
-            .filter(pl.col("tenor").is_in(tenors))
-            .select(["date", "tenor", "price"])
-            .drop_nulls("price")
-            .sort(["tenor", "date"])
-        )
-    else:
-        # Wide format
-        wide_cols = [c for c in px_daily_pl.columns if c in tenors]
-        px_long = (
-            px_daily_pl
-            .rename({date_col: "date"})
-            .pipe(
-                lambda df: _unpivot(df, on=wide_cols, index="date",
-                                    variable_name="tenor", value_name="price")
-            )
-            .drop_nulls("price")
-            .sort(["tenor", "date"])
-        )
-
-    print(f"\n  iv_long : {iv_long.shape}")
-    print(iv_long.head(3))
-    print(f"\n  px_long : {px_long.shape}")
-    print(px_long.head(3))
-
-    return iv_long, px_long
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# PHASE 2 — REALIZED VOLATILITY
-# ══════════════════════════════════════════════════════════════════════════
+# ── Step 3 ────────────────────────────────────────────────────────────────
 
 def compute_rv(
     px_long:    pl.DataFrame,
@@ -309,11 +351,13 @@ def compute_rv(
     direction:  str = DIRECTION,
 ) -> pl.DataFrame:
     """
-    Annualised realised volatility over a tau-day window per (FOMC date, tenor).
+    Step 3 / Phase 2: Annualised realised volatility over a tau-day window
+    per (FOMC date, tenor).  Defined once here; called by both Part A and
+    Part B.
 
     Parameters
     ----------
-    px_long    : (date, tenor, price) daily price panel
+    px_long    : (date, tenor, price) — daily price panel
     fomc_dates : pl.Series[Date] — one entry per FOMC meeting
     tau        : window length in trading days (default 21 ≈ monthly option)
     direction  : "forward"  → tau days strictly after fomc_date
@@ -322,13 +366,16 @@ def compute_rv(
     Returns
     -------
     rv_longf : (fomc_date, tenor, rv, n_days)
-        rv in annualised percentage points to match IV convention.
-        Rows with < max(2, tau//2) return days are silently dropped.
+        rv in annualised percentage points (matches IV convention).
+        Rows with fewer than 60% of tau observations are returned as null
+        and then dropped, rather than emitting a noisy estimate.
     """
     if direction not in ("forward", "backward"):
         raise ValueError("direction must be 'forward' or 'backward'")
 
-    # Daily log returns, computed once per tenor using .over() window
+    min_obs = max(2, int(np.ceil(tau * 0.6)))   # 60% of tau
+
+    # Daily log returns, partitioned by tenor so no cross-tenor contamination
     lr = (
         px_long
         .sort(["tenor", "date"])
@@ -340,8 +387,7 @@ def compute_rv(
         .drop_nulls("log_ret")
     )
 
-    fomc_list  = fomc_dates.cast(pl.Date).to_list()
-    min_obs    = max(2, tau // 2)
+    fomc_list = fomc_dates.cast(pl.Date).to_list()
     records: list[dict] = []
 
     for tenor_key, grp in lr.group_by("tenor", maintain_order=True):
@@ -352,17 +398,17 @@ def compute_rv(
 
         for fd in fomc_list:
             if direction == "forward":
-                idx = [i for i, d in enumerate(dates_arr) if d > fd]
+                idx        = [i for i, d in enumerate(dates_arr) if d > fd]
                 idx_window = idx[:tau]
             else:
-                idx = [i for i, d in enumerate(dates_arr) if d < fd]
+                idx        = [i for i, d in enumerate(dates_arr) if d < fd]
                 idx_window = idx[-tau:]
 
             if len(idx_window) < min_obs:
                 continue
 
-            r       = rets_arr[idx_window]
-            rv_val  = np.sqrt(252 / len(r) * np.sum(r ** 2)) * 100   # annualised pp
+            r      = rets_arr[idx_window]
+            rv_val = np.sqrt(252 / len(r) * np.sum(r ** 2)) * 100   # annualised pp
 
             records.append({
                 "fomc_date": fd,
@@ -377,25 +423,354 @@ def compute_rv(
         .sort(["tenor", "fomc_date"])
     )
 
-    print(f"\n  rv_longf : {rv_longf.shape}  ({direction}, tau={tau}d)")
+    print(f"\n  rv_longf: {rv_longf.shape}  ({direction}, tau={tau}d, min_obs={min_obs})")
     print(rv_longf.head(3))
     return rv_longf
 
 
+# ── Step 4 ────────────────────────────────────────────────────────────────
+
+def sanity_check_scale(
+    iv_long:    pl.DataFrame,
+    rv_longf:   pl.DataFrame,
+    warn_ratio: tuple[float, float] = (0.2, 5.0),
+) -> None:
+    """
+    Step 4: Compare median(iv) and median(rv).  Both should be in the same
+    order of magnitude (annualised pp) if the unit fix in Step 1 was correct.
+
+    Warns loudly — and prints the raw IV median — if the ratio falls outside
+    warn_ratio, so the user can recheck Step 1 without proceeding silently
+    into a nonsense VRP study.
+
+    Parameters
+    ----------
+    iv_long    : (fomc_date, tenor, iv)   — output of clean_iv unpivoted
+    rv_longf   : (fomc_date, tenor, rv)   — output of compute_rv
+    warn_ratio : acceptable (lo, hi) band for median_rv / median_iv
+    """
+    med_iv = float(iv_long["iv"].drop_nulls().median())
+    med_rv = float(rv_longf["rv"].drop_nulls().median())
+
+    print(f"\n  [sanity_check_scale]")
+    print(f"    median IV : {med_iv:.3f} pp")
+    print(f"    median RV : {med_rv:.3f} pp")
+
+    if med_iv == 0:
+        print("  ⚠ WARNING: median IV is zero — check impl_clean for data issues.")
+        return
+
+    ratio = med_rv / med_iv
+    print(f"    ratio RV/IV : {ratio:.3f}")
+
+    lo, hi = warn_ratio
+    if lo <= ratio <= hi:
+        print(f"  ✓ Ratio {ratio:.3f} is within [{lo}, {hi}] — scales match.")
+    else:
+        print(f"\n  ✗ WARNING: ratio {ratio:.3f} is OUTSIDE [{lo}, {hi}].")
+        print("    This strongly suggests Step 1 unit detection picked the wrong branch.")
+        print(f"    Raw IV global median before scaling: re-run inspect_raw and clean_iv")
+        print(f"    and check the printed 'raw global median' line.")
+        print("    Do NOT proceed to the VRP study until scales are reconciled.")
+
+
+# ── Part A orchestrator ───────────────────────────────────────────────────
+
+def run_cleaning_pipeline(
+    impl_pl:     pl.DataFrame,
+    rv_pl:       pl.DataFrame,
+    px_daily_pl: Optional[pl.DataFrame] = None,
+    tau:         int   = TAU,
+    cap:         float = IV_CAP,
+) -> dict:
+    """
+    Run Steps 0–4 and return cleaned outputs ready for the VRP study.
+
+    Supply px_daily_pl if rv_pl was detected as sparse (one price per FOMC
+    meeting) — paste it from the BQL snippet printed in Step 2 and re-run.
+
+    Returns
+    -------
+    dict with keys:
+        impl_clean  — scaled / capped implied vol frame (wide)
+        iv_long     — (fomc_date, tenor, iv) long format
+        rv_longf    — (fomc_date, tenor, rv, n_days)
+        px_long     — (date, tenor, price) daily panel
+        tenors      — list of tenor strings
+    """
+    print("\n" + "▓" * 62)
+    print("  PART A — STEP 0: INSPECT RAW FRAMES")
+    print("▓" * 62)
+    impl_pl, rv_pl, tenors = inspect_raw(impl_pl, rv_pl)
+
+    print("\n" + "▓" * 62)
+    print("  PART A — STEP 1: CLEAN IMPLIED VOL")
+    print("▓" * 62)
+    impl_clean = clean_iv(impl_pl, cap=cap)
+
+    print("\n" + "▓" * 62)
+    print("  PART A — STEP 2: RV SOURCE CHECK")
+    print("▓" * 62)
+    if px_daily_pl is not None:
+        print("  px_daily_pl supplied by caller — skipping sparse-detection.")
+        # Normalise to long format if needed
+        date_col = px_daily_pl.columns[0]
+        if "tenor" in px_daily_pl.columns and "price" in px_daily_pl.columns:
+            px_long = (
+                px_daily_pl
+                .rename({date_col: "date"})
+                .filter(pl.col("tenor").is_in(tenors))
+                .select(["date", "tenor", "price"])
+                .drop_nulls("price")
+                .sort(["tenor", "date"])
+            )
+        else:
+            wide_cols = [c for c in px_daily_pl.columns if c in tenors]
+            px_long = (
+                _unpivot(
+                    px_daily_pl.rename({date_col: "date"}),
+                    on=wide_cols, index="date",
+                    variable_name="tenor", value_name="price",
+                )
+                .drop_nulls("price")
+                .sort(["tenor", "date"])
+            )
+        is_daily = True
+    else:
+        is_daily, px_long = check_rv_source(rv_pl, impl_pl, tenors)
+
+    if not is_daily or px_long is None:
+        print("\n  Part A halted — re-pull daily prices with the BQL snippet above,")
+        print("  then re-call: run_cleaning_pipeline(..., px_daily_pl=px_daily_pl)")
+        return {}
+
+    print("\n" + "▓" * 62)
+    print(f"  PART A — STEP 3: COMPUTE RV  (tau={tau}d, {DIRECTION})")
+    print("▓" * 62)
+    rv_longf = compute_rv(px_long, impl_clean["fomc_date"], tau=tau, direction=DIRECTION)
+
+    # Long-format IV for sanity check and downstream use
+    iv_long = (
+        _unpivot(impl_clean, on=tenors, index="fomc_date",
+                 variable_name="tenor", value_name="iv")
+        .drop_nulls("iv")
+        .sort(["tenor", "fomc_date"])
+    )
+
+    print("\n" + "▓" * 62)
+    print("  PART A — STEP 4: SCALE SANITY CHECK")
+    print("▓" * 62)
+    sanity_check_scale(iv_long, rv_longf)
+
+    # ── Change summary ────────────────────────────────────────────────────
+    orig_nulls  = sum(impl_pl[t].null_count() for t in tenors)
+    clean_nulls = sum(impl_clean[t].null_count() for t in tenors)
+    new_nulls   = clean_nulls - orig_nulls
+
+    print("\n" + "═" * 62)
+    print("  PART A SUMMARY")
+    print("═" * 62)
+    print(f"  Tenors        : {tenors}")
+    print(f"  IV scale      : see Step 1 output above")
+    print(f"  Cells nulled  : {new_nulls} (bad ticks above cap={cap}pp)")
+    print(f"  impl_clean    : {impl_clean.shape}")
+    print(f"  iv_long       : {iv_long.shape}")
+    print(f"  rv_longf      : {rv_longf.shape}")
+    print(f"  px_long       : {px_long.shape}")
+    print("═" * 62)
+
+    return {
+        "impl_clean": impl_clean,
+        "iv_long":    iv_long,
+        "rv_longf":   rv_longf,
+        "px_long":    px_long,
+        "tenors":     tenors,
+    }
+
+
+# ── CELL BREAK ────────────────────────────────────────────────────────────
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 3 — DICHOTOMY (VRP)
+# PART B — IMPLIED-vs-REALIZED VRP STUDY
 # ══════════════════════════════════════════════════════════════════════════
+
+
+# ── Phase 0 ───────────────────────────────────────────────────────────────
+
+def inspect_and_validate(
+    impl_pl:   pl.DataFrame,
+    rv_pl:     pl.DataFrame,
+    regime_pl: pl.DataFrame,
+) -> tuple[
+    pl.DataFrame,
+    pl.DataFrame,
+    pl.DataFrame,
+    Optional[pl.DataFrame],
+    list[str],
+    str,
+    str,
+]:
+    """
+    Phase 0: Inspect all three frames, rename/cast date columns, detect
+    regime column names, and check whether rv_pl is a usable daily panel.
+
+    When called after run_cleaning_pipeline, impl_pl will already be clean
+    and rv_pl sparse-check will be bypassed by passing px_daily_pl directly
+    to run_fomc_vol_study.  This function is retained so Part B can also be
+    run standalone on already-clean data.
+
+    Returns
+    -------
+    impl_pl, rv_pl, regime_pl  — cast / renamed
+    px_daily_pl                — daily price frame or None
+    tenors                     — tenor label list
+    regime_date_col            — name of the date col in regime_pl
+    regime_label_col           — name of the label col in regime_pl
+    """
+    def _report(name: str, df: pl.DataFrame) -> None:
+        print(f"\n{'═'*60}\n  {name}   shape={df.shape}\n{'═'*60}")
+        print("  Schema:")
+        for col, dtype in df.schema.items():
+            print(f"    {col:30s}  {dtype}")
+        print(f"\n  Head (3 rows):\n{df.head(3)}")
+        nulls = {c: df[c].null_count() for c in df.columns if df[c].null_count()}
+        print(f"  Null counts: {nulls if nulls else 'none'}")
+
+    _report("impl_pl",   impl_pl)
+    _report("rv_pl",     rv_pl)
+    _report("regime_pl", regime_pl)
+
+    tenors: list[str] = impl_pl.columns[1:]
+    print(f"\n  Detected tenors: {tenors}")
+
+    impl_pl = _fix_date_col(impl_pl, "fomc_date")
+    rv_pl   = _fix_date_col(rv_pl,   "fomc_date")
+
+    # ── regime column detection ───────────────────────────────────────────
+    def _is_date_col(df: pl.DataFrame, col: str) -> bool:
+        return df[col].dtype in (pl.Date, pl.Datetime) or "date" in col.lower()
+
+    regime_date_col  = next(
+        (c for c in regime_pl.columns if _is_date_col(regime_pl, c)),
+        regime_pl.columns[0],
+    )
+    regime_label_col = next(
+        (c for c in regime_pl.columns if c != regime_date_col),
+        regime_pl.columns[1],
+    )
+    print(f"  regime_date_col='{regime_date_col}'  "
+          f"regime_label_col='{regime_label_col}'")
+
+    if regime_pl[regime_date_col].dtype is not pl.Date:
+        try:
+            regime_pl = regime_pl.with_columns(
+                pl.col(regime_date_col).cast(pl.Date)
+            )
+        except Exception:
+            regime_pl = regime_pl.with_columns(
+                pl.col(regime_date_col).str.to_date(strict=False)
+            )
+
+    # ── rv_pl daily / sparse check ────────────────────────────────────────
+    n_rv    = rv_pl.shape[0]
+    n_fomc  = impl_pl.shape[0]
+    gaps    = rv_pl["fomc_date"].sort().cast(pl.Int32).diff().drop_nulls()
+    med_gap = float(gaps.median() or 0)
+
+    is_daily = (n_rv > n_fomc * 3) or (0 < med_gap <= 7)
+
+    if is_daily:
+        print(f"\n  ✓ rv_pl: {n_rv} rows, median gap {med_gap:.0f}d → daily panel.")
+        rv_pl       = rv_pl.rename({"fomc_date": "date"})
+        px_daily_pl: Optional[pl.DataFrame] = rv_pl
+    else:
+        print(f"\n  ✗ rv_pl: {n_rv} rows ≈ {n_fomc} meetings (gap {med_gap:.0f}d).")
+        print("  Pass px_daily_pl= to run_fomc_vol_study, or run Part A first.")
+        px_daily_pl = None
+
+    return (
+        impl_pl, rv_pl, regime_pl,
+        px_daily_pl, tenors, regime_date_col, regime_label_col,
+    )
+
+
+# ── Phase 1 ───────────────────────────────────────────────────────────────
+
+def tidy_to_long(
+    impl_pl:     pl.DataFrame,
+    px_daily_pl: pl.DataFrame,
+    tenors:      list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Phase 1: Unpivot implied vol (wide→long) and standardise the daily
+    price panel to long format.
+
+    Parameters
+    ----------
+    impl_pl      : (fomc_date, *tenors) — cleaned implied vols
+    px_daily_pl  : daily prices, wide (date, *tenors) or long (date, tenor, price)
+    tenors       : tenor labels
+
+    Returns
+    -------
+    iv_long : (fomc_date, tenor, iv)
+    px_long : (date, tenor, price) sorted [tenor, date]
+    """
+    iv_long = (
+        _unpivot(impl_pl, on=tenors, index="fomc_date",
+                 variable_name="tenor", value_name="iv")
+        .drop_nulls("iv")
+        .sort(["tenor", "fomc_date"])
+    )
+
+    date_col = px_daily_pl.columns[0]
+    if "tenor" in px_daily_pl.columns and "price" in px_daily_pl.columns:
+        px_long = (
+            px_daily_pl
+            .rename({date_col: "date"})
+            .filter(pl.col("tenor").is_in(tenors))
+            .select(["date", "tenor", "price"])
+            .drop_nulls("price")
+            .sort(["tenor", "date"])
+        )
+    else:
+        wide_cols = [c for c in px_daily_pl.columns if c in tenors]
+        px_long = (
+            _unpivot(
+                px_daily_pl.rename({date_col: "date"}),
+                on=wide_cols, index="date",
+                variable_name="tenor", value_name="price",
+            )
+            .drop_nulls("price")
+            .sort(["tenor", "date"])
+        )
+
+    print(f"\n  iv_long : {iv_long.shape}")
+    print(iv_long.head(3))
+    print(f"\n  px_long : {px_long.shape}")
+    print(px_long.head(3))
+
+    return iv_long, px_long
+
+
+# ── Phase 2 ───────────────────────────────────────────────────────────────
+# compute_rv is defined in Part A (Step 3) above — no redefinition needed.
+# Call: rv_longf = compute_rv(px_long, fomc_dates, tau=tau, direction=direction)
+
+
+# ── Phase 3 ───────────────────────────────────────────────────────────────
 
 def build_vrp(
     iv_long:  pl.DataFrame,
     rv_longf: pl.DataFrame,
 ) -> pl.DataFrame:
     """
-    Join IV and RV; derive VRP, ratio, and under-pricing flag.
+    Phase 3: Join IV and RV; derive VRP, ratio, and under-pricing flag.
 
     Convention
     ----------
-    vrp  = iv - rv
+    vrp  = iv − rv
     vrp > 0  →  market over-priced the meeting (normal vol-risk premium)
     vrp < 0  →  market under-priced; RV exceeded IV (thesis condition)
 
@@ -416,7 +791,6 @@ def build_vrp(
 
     print(f"\n  vrp_pl : {vrp_pl.shape}")
     print(vrp_pl.head(5))
-
     print("\n  Quick stats by tenor:")
     print(
         vrp_pl
@@ -432,9 +806,7 @@ def build_vrp(
     return vrp_pl
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# PHASE 4 — REGIME JOIN & ANALYSIS
-# ══════════════════════════════════════════════════════════════════════════
+# ── Phase 4 ───────────────────────────────────────────────────────────────
 
 def _newey_west_manual(y: np.ndarray, lags: int) -> tuple[float, float]:
     """
@@ -450,11 +822,11 @@ def _newey_west_manual(y: np.ndarray, lags: int) -> tuple[float, float]:
     nw_var = gamma0
 
     for h in range(1, lags + 1):
-        w       = 1.0 - h / (lags + 1)       # Bartlett kernel
+        w       = 1.0 - h / (lags + 1)
         gamma_h = np.sum(resid[h:] * resid[:-h]) / n
         nw_var += 2.0 * w * gamma_h
 
-    nw_var = max(nw_var, 1e-20)               # prevent divide-by-zero
+    nw_var = max(nw_var, 1e-20)
     se     = np.sqrt(nw_var / n)
     t_stat = ybar / se
     p_val  = 2.0 * float(sp_stats.t.sf(abs(t_stat), df=n - 1))
@@ -475,15 +847,15 @@ def _nw_test(y: np.ndarray, lags: int) -> tuple[float, float]:
 
 
 def summarize_by_regime(
-    vrp_pl:          pl.DataFrame,
-    regime_pl:       pl.DataFrame,
-    regime_date_col: str,
+    vrp_pl:           pl.DataFrame,
+    regime_pl:        pl.DataFrame,
+    regime_date_col:  str,
     regime_label_col: str,
-    hac_lags:        int = HAC_LAGS,
+    hac_lags:         int = HAC_LAGS,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """
-    Join VRP with regime labels; compute per-(regime, tenor) summary stats
-    with Newey-West HAC significance tests.
+    Phase 4: Join VRP with regime labels; compute per-(regime, tenor)
+    summary stats with Newey-West HAC significance tests.
 
     Parameters
     ----------
@@ -509,13 +881,12 @@ def summarize_by_regime(
     if n_miss:
         print(f"\n  ⚠ {n_miss} VRP rows have no matching regime — check date alignment.")
 
-    # Filter labelled rows before grouping
     vrp_labelled = vrp_regime_pl.filter(pl.col("regime").is_not_null())
-
     rows: list[dict] = []
 
-    def _stats(y: np.ndarray, ratios: np.ndarray, regime: str, tenor: str) -> dict:
-        t_stat, p_val = (np.nan, np.nan)
+    def _stats(y: np.ndarray, ratios: np.ndarray,
+               regime: str, tenor: str) -> dict:
+        t_stat, p_val = np.nan, np.nan
         if len(y) >= 2:
             lag = min(hac_lags, len(y) - 1)
             t_stat, p_val = _nw_test(y, lag)
@@ -523,36 +894,38 @@ def summarize_by_regime(
             "regime":          regime,
             "tenor":           tenor,
             "n":               len(y),
-            "mean_vrp":        float(np.mean(y))          if len(y) else np.nan,
-            "median_vrp":      float(np.median(y))        if len(y) else np.nan,
-            "std_vrp":         float(np.std(y, ddof=1))   if len(y) > 1 else np.nan,
-            "pct_underpriced": float(np.mean(y < 0))      if len(y) else np.nan,
-            "mean_ratio":      float(np.nanmean(ratios))  if len(ratios) else np.nan,
+            "mean_vrp":        float(np.mean(y))         if len(y) else np.nan,
+            "median_vrp":      float(np.median(y))       if len(y) else np.nan,
+            "std_vrp":         float(np.std(y, ddof=1))  if len(y) > 1 else np.nan,
+            "pct_underpriced": float(np.mean(y < 0))     if len(y) else np.nan,
+            "mean_ratio":      float(np.nanmean(ratios)) if len(ratios) else np.nan,
             "t_stat_nw":       t_stat,
             "p_value_nw":      p_val,
         }
 
-    # (regime, tenor) breakdown
     for keys, grp in vrp_labelled.group_by(["regime", "tenor"], maintain_order=False):
         r, t = keys
-        y    = grp["vrp"].drop_nulls().to_numpy()
-        ra   = grp["ratio"].drop_nulls().to_numpy()
-        rows.append(_stats(y, ra, str(r), str(t)))
+        rows.append(_stats(
+            grp["vrp"].drop_nulls().to_numpy(),
+            grp["ratio"].drop_nulls().to_numpy(),
+            str(r), str(t),
+        ))
 
-    # (regime, ALL) pooled
     for r_key, grp in vrp_labelled.group_by("regime", maintain_order=False):
-        r  = str(_key(r_key))
-        y  = grp["vrp"].drop_nulls().to_numpy()
-        ra = grp["ratio"].drop_nulls().to_numpy()
-        rows.append(_stats(y, ra, r, "ALL"))
+        r = str(_key(r_key))
+        rows.append(_stats(
+            grp["vrp"].drop_nulls().to_numpy(),
+            grp["ratio"].drop_nulls().to_numpy(),
+            r, "ALL",
+        ))
 
     regime_summary_pl = (
         pl.DataFrame(rows)
         .with_columns([
             pl.col("n").cast(pl.Int32),
-            pl.col(c).cast(pl.Float64)
-            for c in ["mean_vrp", "median_vrp", "std_vrp",
-                       "pct_underpriced", "mean_ratio", "t_stat_nw", "p_value_nw"]
+            *[pl.col(c).cast(pl.Float64)
+              for c in ["mean_vrp", "median_vrp", "std_vrp",
+                        "pct_underpriced", "mean_ratio", "t_stat_nw", "p_value_nw"]],
         ])
         .sort(["regime", "tenor"])
     )
@@ -565,42 +938,37 @@ def summarize_by_regime(
     print("  ║ primary guide. Forward windows also overlap, which NW   ║")
     print("  ║ only partially corrects via HAC.                        ║")
     print("  ╚══════════════════════════════════════════════════════════╝\n")
-
     print("  Regime Summary (tenor='ALL' = pooled across all tenors):")
     print(regime_summary_pl)
 
-    latest_date  = vrp_regime_pl["fomc_date"].max()
+    latest_date    = vrp_regime_pl["fomc_date"].max()
     latest_regimes = (
         vrp_regime_pl
         .filter(pl.col("fomc_date") == latest_date)
-        ["regime"]
-        .unique()
-        .to_list()
+        ["regime"].unique().to_list()
     )
     print(f"\n  ★ Most recent FOMC: {latest_date}  |  Regime: {latest_regimes}")
 
     return vrp_regime_pl, regime_summary_pl
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# PHASE 5 — VISUALS
-# ══════════════════════════════════════════════════════════════════════════
+# ── Phase 5 ───────────────────────────────────────────────────────────────
 
 def plot_vrp_study(
-    vrp_regime_pl:    pl.DataFrame,
+    vrp_regime_pl:     pl.DataFrame,
     regime_summary_pl: pl.DataFrame,
 ) -> None:
     """
-    Three figures:
+    Phase 5: Three figures:
       1. VRP time series per tenor with regime colour bands
       2. Mean VRP bar chart by regime × tenor
       3. IV vs RV scatter coloured by regime with 45° line
     """
-    tenors  = sorted(t for t in vrp_regime_pl["tenor"].unique().to_list())
+    tenors  = sorted(vrp_regime_pl["tenor"].unique().to_list())
     regimes = sorted(vrp_regime_pl["regime"].drop_nulls().unique().to_list())
     colors  = _regime_colors(vrp_regime_pl["regime"])
 
-    # ── Fig 1: VRP time series per tenor ─────────────────────────────────
+    # Fig 1 — VRP time series
     n = len(tenors)
     fig1, axes = plt.subplots(n, 1, figsize=(14, 3 * n), sharex=True)
     if n == 1:
@@ -614,8 +982,6 @@ def plot_vrp_study(
 
         ax.axhline(0, color="black", lw=0.9, ls="--", zorder=4)
         ax.plot(dates, vrp, color="#2166ac", lw=1.3, zorder=3)
-
-        # Green above zero, red below
         ax.fill_between(dates, 0, vrp,
                          where=[v is not None and v >= 0 for v in vrp],
                          color="#4dac26", alpha=0.22, label="Over-priced (IV>RV)")
@@ -623,7 +989,6 @@ def plot_vrp_study(
                          where=[v is not None and v <  0 for v in vrp],
                          color="#d01c8b", alpha=0.22, label="Under-priced (RV>IV)")
 
-        # Regime background shading
         for i, (d, r) in enumerate(zip(dates, reg)):
             if r is None:
                 continue
@@ -633,25 +998,17 @@ def plot_vrp_study(
         ax.set_ylabel(f"{tenor}\nVRP (pp)", fontsize=8)
         ax.grid(axis="y", lw=0.4, alpha=0.5)
 
-    # Regime legend on last panel
-    regime_patches = [
-        mpatches.Patch(color=colors[r], alpha=0.55, label=r) for r in regimes
-    ]
     axes[-1].legend(
-        handles=regime_patches, title="Regime", fontsize=7,
-        title_fontsize=7, loc="lower right", ncol=2,
+        handles=[mpatches.Patch(color=colors[r], alpha=0.55, label=r) for r in regimes],
+        title="Regime", fontsize=7, title_fontsize=7, loc="lower right", ncol=2,
     )
     axes[-1].set_xlabel("FOMC Date")
     fig1.suptitle("VRP per Tenor Around FOMC Meetings  (VRP = IV − RV)", fontsize=11)
     fig1.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
 
-    # ── Fig 2: Bar chart mean VRP by regime × tenor ───────────────────────
-    sum_t = (
-        regime_summary_pl
-        .filter(pl.col("tenor") != "ALL")
-        .sort(["regime", "tenor"])
-    )
+    # Fig 2 — bar chart
+    sum_t       = regime_summary_pl.filter(pl.col("tenor") != "ALL").sort(["regime", "tenor"])
     regime_list = sorted(sum_t["regime"].unique().to_list())
     tenor_list  = sorted(sum_t["tenor"].unique().to_list())
     x           = np.arange(len(regime_list))
@@ -660,12 +1017,11 @@ def plot_vrp_study(
 
     fig2, ax2 = plt.subplots(figsize=(max(8, len(regime_list) * 1.5), 5))
     for i, t in enumerate(tenor_list):
-        heights = []
-        for r in regime_list:
-            v = sum_t.filter(
-                (pl.col("regime") == r) & (pl.col("tenor") == t)
-            )["mean_vrp"].to_list()
-            heights.append(v[0] if v else 0.0)
+        heights = [
+            (sum_t.filter((pl.col("regime") == r) & (pl.col("tenor") == t))
+             ["mean_vrp"].to_list() or [0.0])[0]
+            for r in regime_list
+        ]
         ax2.bar(x + i * width, heights, width, label=t,
                 color=cmap_t(i), alpha=0.85, edgecolor="white", lw=0.5)
 
@@ -678,14 +1034,12 @@ def plot_vrp_study(
     fig2.tight_layout()
     plt.show()
 
-    # ── Fig 3: IV vs RV scatter coloured by regime ───────────────────────
+    # Fig 3 — IV vs RV scatter
     fig3, ax3 = plt.subplots(figsize=(8, 7))
     for r in regimes:
         sub = vrp_regime_pl.filter(pl.col("regime") == r)
-        ax3.scatter(
-            sub["iv"].to_list(), sub["rv"].to_list(),
-            label=r, color=colors[r], alpha=0.65, s=28, edgecolors="none",
-        )
+        ax3.scatter(sub["iv"].to_list(), sub["rv"].to_list(),
+                    label=r, color=colors[r], alpha=0.65, s=28, edgecolors="none")
 
     all_v = np.concatenate([
         vrp_regime_pl["iv"].drop_nulls().to_numpy(),
@@ -699,30 +1053,26 @@ def plot_vrp_study(
     ax3.set_ylim(mn - pad, mx + pad)
     ax3.set_xlabel("Implied Vol (pp)")
     ax3.set_ylabel("Realized Vol (pp)")
-    ax3.set_title("IV vs RV by Regime  —  points below 45° line = under-priced meeting")
+    ax3.set_title("IV vs RV by Regime  —  points below 45° = under-priced meeting")
     ax3.legend(fontsize=8, title="Regime", title_fontsize=8)
     ax3.grid(lw=0.4, alpha=0.5)
     fig3.tight_layout()
     plt.show()
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# PHASE 6 — SAVE & PRINT SUMMARY
-# ══════════════════════════════════════════════════════════════════════════
+# ── Phase 6 ───────────────────────────────────────────────────────────────
 
 def save_and_summarize(
-    vrp_regime_pl:    pl.DataFrame,
+    vrp_regime_pl:     pl.DataFrame,
     regime_summary_pl: pl.DataFrame,
-    output_dir:       Path = OUTPUT_DIR,
+    output_dir:        Path = OUTPUT_DIR,
 ) -> None:
-    """Write parquet files and print a concise analytical summary."""
+    """Phase 6: Write parquet files and print a concise analytical summary."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    vrp_path = output_dir / "vrp_pl.parquet"
-    sum_path = output_dir / "regime_summary_pl.parquet"
-    vrp_regime_pl.write_parquet(vrp_path)
-    regime_summary_pl.write_parquet(sum_path)
-    print(f"\n  Saved → {vrp_path}")
-    print(f"  Saved → {sum_path}")
+    vrp_regime_pl.write_parquet(output_dir / "vrp_pl.parquet")
+    regime_summary_pl.write_parquet(output_dir / "regime_summary_pl.parquet")
+    print(f"\n  Saved → {output_dir / 'vrp_pl.parquet'}")
+    print(f"  Saved → {output_dir / 'regime_summary_pl.parquet'}")
 
     pooled = (
         regime_summary_pl
@@ -734,50 +1084,37 @@ def save_and_summarize(
     print("  ANALYTICAL SUMMARY — FOMC Implied-vs-Realized VRP Study")
     print("═" * 62)
 
-    under = pooled.filter(pl.col("mean_vrp") < 0)
-    over  = pooled.filter(pl.col("mean_vrp") >= 0)
-
     def _sig(row: dict) -> str:
         p = row.get("p_value_nw", 1.0)
-        if p is None or np.isnan(p):
+        if p is None or (isinstance(p, float) and np.isnan(p)):
             return ""
-        if p < 0.01:
-            return " ***"
-        if p < 0.05:
-            return " **"
-        if p < 0.10:
-            return " *"
-        return ""
+        return " ***" if p < 0.01 else " **" if p < 0.05 else " *" if p < 0.10 else ""
+
+    under = pooled.filter(pl.col("mean_vrp") < 0)
+    over  = pooled.filter(pl.col("mean_vrp") >= 0)
 
     if under.is_empty():
         print("\n  No regime shows negative mean VRP (all tenors pooled).")
     else:
         print("\n  Under-priced regimes  (RV > IV, mean_vrp < 0):")
         for row in under.iter_rows(named=True):
-            print(
-                f"    {str(row['regime']):22s}  "
-                f"mean_vrp={row['mean_vrp']:+6.2f}pp  "
-                f"pct_under={row['pct_underpriced']:.0%}  "
-                f"n={row['n']}"
-                + _sig(row)
-            )
+            print(f"    {str(row['regime']):22s}  "
+                  f"mean_vrp={row['mean_vrp']:+6.2f}pp  "
+                  f"pct_under={row['pct_underpriced']:.0%}  "
+                  f"n={row['n']}" + _sig(row))
 
     if not over.is_empty():
         print("\n  Over-priced regimes  (IV > RV, normal insurance premium):")
         for row in over.iter_rows(named=True):
-            print(
-                f"    {str(row['regime']):22s}  "
-                f"mean_vrp={row['mean_vrp']:+6.2f}pp  "
-                f"pct_under={row['pct_underpriced']:.0%}  "
-                f"n={row['n']}"
-                + _sig(row)
-            )
+            print(f"    {str(row['regime']):22s}  "
+                  f"mean_vrp={row['mean_vrp']:+6.2f}pp  "
+                  f"pct_under={row['pct_underpriced']:.0%}  "
+                  f"n={row['n']}" + _sig(row))
 
     print("\n  Significance (NW-HAC): *** p<0.01  ** p<0.05  * p<0.10")
 
-    # Current regime read
-    latest      = vrp_regime_pl["fomc_date"].max()
-    curr_rows   = vrp_regime_pl.filter(pl.col("fomc_date") == latest)
+    latest    = vrp_regime_pl["fomc_date"].max()
+    curr_rows = vrp_regime_pl.filter(pl.col("fomc_date") == latest)
     if not curr_rows.is_empty():
         curr_regime = curr_rows["regime"][0]
         curr_vrp    = curr_rows["vrp"].mean()
@@ -786,10 +1123,8 @@ def save_and_summarize(
         curr_sum = pooled.filter(pl.col("regime") == curr_regime)
         if not curr_sum.is_empty():
             r = curr_sum.row(0, named=True)
-            print(
-                f"    Full-regime avg VRP: {r['mean_vrp']:+.2f}pp  "
-                f"under-priced {r['pct_underpriced']:.0%} of meetings"
-            )
+            print(f"    Full-regime avg VRP: {r['mean_vrp']:+.2f}pp  "
+                  f"under-priced {r['pct_underpriced']:.0%} of meetings")
 
     print("\n  Note: 21-day forward windows overlap between adjacent meetings;")
     print("  NW-HAC corrects for overlap-induced autocorrelation but remains")
@@ -797,9 +1132,7 @@ def save_and_summarize(
     print("═" * 62)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# MAIN PIPELINE
-# ══════════════════════════════════════════════════════════════════════════
+# ── Part B orchestrator ───────────────────────────────────────────────────
 
 def run_fomc_vol_study(
     impl_pl:      pl.DataFrame,
@@ -812,13 +1145,15 @@ def run_fomc_vol_study(
     output_dir:   Path = OUTPUT_DIR,
 ) -> dict:
     """
-    End-to-end pipeline: Phases 0–6.
+    Part B end-to-end pipeline: Phases 0–6.
+
+    Best called with impl_pl=cleaning['impl_clean'] and
+    px_daily_pl=cleaning['px_long'] from run_cleaning_pipeline.
 
     Parameters
     ----------
-    impl_pl, rv_pl, regime_pl : raw Bloomberg frames
-    px_daily_pl : supply this (from the BQL snippet) if Phase 0 finds that
-                  rv_pl has only one price per FOMC meeting
+    impl_pl, rv_pl, regime_pl : Bloomberg frames (impl_pl ideally pre-cleaned)
+    px_daily_pl : daily price panel; overrides rv_pl for RV computation
     tau         : RV window in trading days
     direction   : "forward" (post-meeting) | "backward" (pre-meeting)
     hac_lags    : Newey-West kernel truncation
@@ -833,13 +1168,12 @@ def run_fomc_vol_study(
     print("  PHASE 0 — INSPECT & VALIDATE")
     print("█" * 62)
     impl_pl, rv_pl, regime_pl, _px, tenors, rdc, rlc = inspect_and_validate(
-        impl_pl, rv_pl, regime_pl, tau=tau
+        impl_pl, rv_pl, regime_pl
     )
 
     daily_source = px_daily_pl if px_daily_pl is not None else _px
     if daily_source is None:
-        print("\n  Pipeline halted — re-pull daily prices with the BQL snippet above,")
-        print("  then call: run_fomc_vol_study(..., px_daily_pl=px_daily_pl)")
+        print("\n  Pipeline halted — supply px_daily_pl= (from Part A or BQL re-pull).")
         return {}
 
     print("\n" + "█" * 62)
@@ -877,29 +1211,43 @@ def run_fomc_vol_study(
     save_and_summarize(vrp_regime_pl, regime_summary_pl, output_dir=output_dir)
 
     return {
-        "iv_long":            iv_long,
-        "px_long":            px_long,
-        "rv_longf":           rv_longf,
-        "vrp_pl":             vrp_pl,
-        "vrp_regime_pl":      vrp_regime_pl,
-        "regime_summary_pl":  regime_summary_pl,
+        "iv_long":           iv_long,
+        "px_long":           px_long,
+        "rv_longf":          rv_longf,
+        "vrp_pl":            vrp_pl,
+        "vrp_regime_pl":     vrp_regime_pl,
+        "regime_summary_pl": regime_summary_pl,
     }
 
 
-# ── ENTRY POINT ───────────────────────────────────────────────────────────
-# Uncomment and run.  Supply px_daily_pl only after the BQL re-pull if needed.
+# ── ENTRY POINTS ──────────────────────────────────────────────────────────
 #
-# results = run_fomc_vol_study(
+# ── Step 1: clean the raw frames ─────────────────────────────────────────
+#
+# cleaning = run_cleaning_pipeline(
 #     impl_pl     = impl_pl,
 #     rv_pl       = rv_pl,
+#     # px_daily_pl = px_daily_pl,   # ← supply after BQL re-pull if rv_pl is sparse
+#     tau         = 21,
+#     cap         = 40.0,
+# )
+#
+# ── Step 2: run the VRP study ─────────────────────────────────────────────
+#
+# results = run_fomc_vol_study(
+#     impl_pl     = cleaning["impl_clean"],
+#     rv_pl       = rv_pl,
 #     regime_pl   = regime_pl,
-#     # px_daily_pl = px_daily_pl,   # ← from BQL re-pull snippet if rv_pl was sparse
+#     px_daily_pl = cleaning["px_long"],
 #     tau         = 21,
 #     direction   = "forward",
 #     hac_lags    = 21,
 #     output_dir  = Path("."),
 # )
 #
-# # Access individual outputs:
-# # results["vrp_regime_pl"]
-# # results["regime_summary_pl"]
+# # Individual outputs:
+# # cleaning["impl_clean"]     — scaled / capped implied vol (wide)
+# # cleaning["iv_long"]        — (fomc_date, tenor, iv)
+# # cleaning["rv_longf"]       — (fomc_date, tenor, rv, n_days)
+# # results["vrp_regime_pl"]   — full VRP table with regime labels
+# # results["regime_summary_pl"] — stats by (regime, tenor)
