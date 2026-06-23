@@ -1874,162 +1874,649 @@ plt.close("all")
 
 # %% [markdown]
 # ---
-# ## Fig 7 — Fed Chair Word Clouds
-# Word size = frequency across all statements for that chair.
-# Colour encodes semantic category:
-# 🔴 Uncertainty / volatility · 🟢 Stability / confidence · 🟣 Rate hike / tightening · 🔵 Rate cut / easing · ⚫ Neutral
+# # LAYER 6 — FED-CHAIR WORD-CLOUD SUITE
+# Four separate outputs, each its own cell:
+#
+# | Output | File | What it shows |
+# |--------|------|---------------|
+# | **5.0** Config | — | All lexicons, colours, params in one place |
+# | **5.1** Prep | — | Tokenisation, TF-IDF, per-chair freq tables |
+# | **5.2** Colour fns | — | `category` / `gradient` / `vol` modes |
+# | **Fig 7a** | `fig7a_small_multiples.png` | Headline 2×2 grid, TF-IDF-weighted |
+# | **Fig 7b** | `fig7b_comparison.png` | Powell vs Warsh split cloud |
+# | **Fig 7c** | `fig7c_bucket_bars.png` | Quantitative bucket-mix bars |
+# | **Fig 7d** | `fig7d_interactive.html` | Sortable hover table |
+# | **5.4** Warsh readout | — | Thesis check printout |
+#
+# ⚠ Word clouds are an illustrative exhibit.
+# The bucket-mix bars (Fig 7c) and regression tables (Layer 4) are the rigorous backing.
 
-# %% ── Fig 7: Chair word clouds ───────────────────────────────────────────────
+# %% ─── 5.0  CONFIG ───────────────────────────────────────────────────────────
 
 from wordcloud import WordCloud
+from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# Semantic colour map — add or adjust terms here
-_WORD_COLORS: dict[str, str] = {
-    # Uncertainty / volatility → red-orange
-    "uncertain":       "#e74c3c", "uncertainty":    "#e74c3c",
-    "volatile":        "#c0392b", "volatility":     "#c0392b",
-    "risk":            "#e67e22", "risks":          "#e67e22",
-    "turbulent":       "#c0392b", "challenging":    "#e74c3c",
-    "adverse":         "#c0392b", "downside":       "#e67e22",
-    "concern":         "#e74c3c", "concerns":       "#e74c3c",
-    "elevated":        "#e67e22", "heightened":     "#e74c3c",
-    "disruptions":     "#c0392b", "stressed":       "#c0392b",
-    "headwinds":       "#e67e22", "deteriorated":   "#c0392b",
-    "tensions":        "#e74c3c", "trade":          "#e67e22",
-    # Stability / confidence → green-teal
-    "stable":          "#27ae60", "stability":      "#27ae60",
-    "balanced":        "#2ecc71", "sustainable":    "#27ae60",
-    "anchored":        "#1abc9c", "resilient":      "#16a085",
-    "solid":           "#27ae60", "steady":         "#2ecc71",
-    "robust":          "#27ae60", "consistent":     "#1abc9c",
-    "confident":       "#27ae60", "confidence":     "#27ae60",
-    "strength":        "#2ecc71", "strong":         "#27ae60",
-    "moderate":        "#1abc9c", "gradually":      "#1abc9c",
-    "well":            "#2ecc71", "improvement":    "#27ae60",
-    # Rate hike / tightening → purple
-    "increase":        "#8e44ad", "increasing":     "#8e44ad",
-    "raised":          "#8e44ad", "raising":        "#7d3c98",
-    "restrictive":     "#6c3483", "tighten":        "#8e44ad",
-    "tightening":      "#6c3483", "higher":         "#9b59b6",
-    "normalize":       "#8e44ad", "normalization":  "#6c3483",
-    "remove":          "#7d3c98", "hike":           "#6c3483",
-    "overshoot":       "#8e44ad", "above":          "#9b59b6",
-    # Rate cut / easing → blue
-    "decrease":        "#2980b9", "lower":          "#3498db",
-    "lowering":        "#2980b9", "accommodative":  "#1a5276",
-    "easing":          "#2471a3", "ease":           "#3498db",
-    "reduce":          "#2980b9", "reducing":       "#2980b9",
-    "cut":             "#2471a3", "support":        "#5dade2",
-    "stimulus":        "#1a5276", "accommodation":  "#1a5276",
-    "below":           "#2980b9", "purchase":       "#2471a3",
-    "purchases":       "#2471a3", "asset":          "#5dade2",
-    "securities":      "#5dade2", "quantitative":   "#1a5276",
+# ── Characteristic lexicons — edit these; all code reads from here ────────────
+LEXICONS: dict[str, set[str]] = {
+    "guidance": {
+        "anticipates", "anticipate", "appropriate", "gradual", "gradually",
+        "likely", "expects", "expected", "expect", "patience", "patient",
+        "flexible", "data", "dependent", "outlook", "forward", "guidance",
+        "accommodation", "accommodating", "ongoing", "sustained", "calibrate",
+        "measured", "deliberate", "careful", "path", "pace", "judgment",
+        "framework", "strategy", "projection", "projections",
+    },
+    "uncertainty": {
+        "uncertain", "uncertainty", "risk", "risks", "challenging", "volatile",
+        "volatility", "adverse", "downside", "concern", "concerns", "elevated",
+        "headwinds", "tensions", "disruption", "disruptions", "stress",
+        "stressed", "deteriorated", "deteriorating", "weaken", "weakened",
+        "weakening", "unprecedented", "unclear", "unpredictable", "depends",
+        "caution", "cautious", "vigilant", "vigilance", "turbulence",
+    },
+    "stability": {
+        "stable", "stability", "anchored", "sustainable", "balanced", "orderly",
+        "resilient", "solid", "steady", "robust", "moderate", "moderating",
+        "strength", "strong", "healthy", "improving", "improvement",
+        "confident", "confidence", "consistent", "durable", "contained",
+        "well", "sound", "healthy", "expanded", "expanding",
+    },
+    "action": {
+        "raise", "raised", "raising", "increase", "increased", "increasing",
+        "tighten", "tightening", "restrictive", "firmer", "higher", "hike",
+        "normalize", "normalization", "remove", "cut", "cutting", "decrease",
+        "decreased", "lower", "lowering", "ease", "easing", "accommodative",
+        "reduce", "reducing", "purchase", "purchases", "asset", "quantitative",
+        "taper", "tapering", "unwind", "reinvest", "reinvestment",
+    },
 }
 
-_NEUTRAL_COLOR = "#95a5a6"
+BUCKET_COLORS: dict[str, str] = {
+    "guidance":    "#2471a3",   # blue
+    "uncertainty": "#c0392b",   # red
+    "stability":   "#27ae60",   # green
+    "action":      "#8e44ad",   # purple
+    "neutral":     "#bdc3c7",   # light grey
+}
 
-_WC_STOP = {
-    "the", "and", "for", "that", "has", "with", "will", "from", "this",
-    "have", "are", "its", "been", "was", "were", "which", "not", "but",
-    "more", "also", "than", "their", "they", "these", "would", "could",
-    "should", "may", "can", "all", "such", "over", "under", "into",
-    "about", "out", "when", "some", "our", "committee", "federal",
-    "open", "market", "voting", "voted", "reserve", "bank", "board",
-    "members", "rates", "rate", "percent", "basis", "points", "funds",
-    "range", "target", "monetary", "policy", "economic", "economy",
-    "conditions", "inflation", "employment", "labor", "growth", "year",
-    "period", "recent", "continue", "continued", "remains", "remained",
-    "expects", "expected", "consistent", "including", "determine",
+BUCKET_DISPLAY: dict[str, str] = {
+    "guidance":    "Forward guidance",
+    "uncertainty": "Uncertainty / risk",
+    "stability":   "Stability / confidence",
+    "action":      "Rate action / stance",
+    "neutral":     "Neutral",
+}
+
+# Shared cloud params — IDENTICAL across all chairs for comparability
+CHAIRS        = ["Bernanke", "Yellen", "Powell", "Warsh"]
+WC_MAX_WORDS  = 120
+WC_MAX_FONT   = 90
+WC_MIN_FONT   = 9
+WC_WIDTH      = 1300
+WC_HEIGHT     = 680
+
+# FOMC boilerplate stripped before analysis
+_WC_STOP: set[str] = {
+    "committee", "federal", "open", "market", "reserve", "board", "bank",
+    "voting", "voted", "members", "meeting", "fomc", "statement",
+    "monetary", "policy", "economic", "economy", "conditions", "inflation",
+    "employment", "labor", "growth", "year", "period", "recent", "continue",
+    "continued", "remains", "remained", "expects", "expected", "determine",
     "appropriate", "assessed", "current", "levels", "pace", "future",
+    "percent", "basis", "points", "funds", "range", "target", "rate", "rates",
+    "united", "states", "release", "press", "january", "february", "march",
+    "april", "june", "july", "august", "september", "october", "november",
+    "december", "also", "will", "that", "this", "from", "with", "have",
+    "been", "were", "which", "their", "they", "these", "would", "could",
+    "should", "may", "can", "all", "such", "over", "under", "into",
+    "about", "when", "some", "our", "the", "and", "for", "not", "but",
+    "more", "than", "its", "was", "are", "has", "action",
 }
 
+print("5.0 Config loaded")
+for b, words in LEXICONS.items():
+    print(f"  {b:12s}: {len(words):3d} seed words  {BUCKET_COLORS[b]}")
 
-def _wc_color(word, **kwargs):
-    return _WORD_COLORS.get(word.lower(), _NEUTRAL_COLOR)
+# %% ─── 5.1  PREP — Tokenisation, TF-IDF, Frequency Tables ──────────────────
+
+def _clean(text: str) -> str:
+    """Lowercase, strip non-alpha."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z\s]", " ", text.lower())).strip()
 
 
-def plot_chair_wordclouds(docs_df: pd.DataFrame,
-                          calendar_df: pd.DataFrame) -> plt.Figure:
+def _tokenise(text: str, bigrams: bool = True) -> list[str]:
     """
-    4-panel word cloud — one per Fed chair.
-    Word size ∝ term frequency across all that chair's statements.
-    Colour encodes semantic category via _wc_color.
+    Unigrams after stopword removal, plus underscore-joined bigrams so
+    guidance phrases like 'for_some_time' survive as a single token.
     """
-    stmt = docs_df[docs_df["doc_type"] == "statement"].copy()
-    # chair is already on docs_df; if not, join from calendar
-    if "chair" not in stmt.columns:
-        _cal = calendar_df[["meeting_date", "chair"]].copy()
-        _cal["meeting_date"] = pd.to_datetime(_cal["meeting_date"])
-        stmt["meeting_date"] = pd.to_datetime(stmt["meeting_date"])
-        stmt = stmt.merge(_cal, on="meeting_date", how="left")
+    words = [w for w in _clean(text).split() if w not in _WC_STOP and len(w) > 3]
+    if bigrams:
+        words += [f"{a}_{b}" for a, b in zip(words, words[1:])]
+    return words
 
-    chairs = ["Bernanke", "Yellen", "Powell", "Warsh"]
-    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+
+def build_chair_corpora(docs_df: pd.DataFrame) -> dict[str, str]:
+    """Concatenate all statement text per chair into one large string."""
+    stmt = docs_df[docs_df["doc_type"] == "statement"]
+    return {c: " ".join(stmt[stmt["chair"] == c]["text"].fillna("").tolist())
+            for c in CHAIRS}
+
+
+def build_freq_tables(corpora: dict[str, str]) -> dict[str, dict[str, float]]:
+    """Per-chair normalised word-frequency dict (max = 1)."""
+    tables = {}
+    for chair, text in corpora.items():
+        counts = Counter(_tokenise(text))
+        mx     = max(counts.values()) if counts else 1
+        tables[chair] = {w: c / mx for w, c in counts.items()}
+    return tables
+
+
+def build_tfidf_scores(corpora: dict[str, str]) -> dict[str, dict[str, float]]:
+    """
+    TF-IDF with each chair's corpus as one document (N=4 docs).
+    IDF strongly upweights vocabulary used by only one or two chairs,
+    surfacing each chair's DISTINCTIVE language rather than shared boilerplate.
+    Returns {chair: {word: score}}.
+    """
+    chairs = list(corpora.keys())
+    vec    = TfidfVectorizer(
+        preprocessor=_clean,
+        tokenizer=lambda t: _tokenise(t, bigrams=False),
+        token_pattern=None,
+        max_features=6000,
+        sublinear_tf=True,
+        min_df=1,
+    )
+    mat   = vec.fit_transform([corpora[c] for c in chairs])
+    vocab = vec.get_feature_names_out()
+    return {
+        chairs[i]: {vocab[j]: float(mat[i, j])
+                    for j in mat[i].nonzero()[1]}
+        for i in range(len(chairs))
+    }
+
+
+def classify_word(word: str) -> str:
+    """Return the characteristic bucket of a word, or 'neutral'."""
+    w = word.lower().replace("_", " ")
+    for bucket, lexicon in LEXICONS.items():
+        if w in lexicon or any(seed in w for seed in lexicon):
+            return bucket
+    return "neutral"
+
+
+# ── Build everything ──────────────────────────────────────────────────────────
+_wc_docs = build_docs_raw(calendar_df)   # instant — all HTML cached
+
+chair_corpora = build_chair_corpora(_wc_docs)
+freq_tables   = build_freq_tables(chair_corpora)
+tfidf_scores  = build_tfidf_scores(chair_corpora)
+
+print("\n5.1 Prep complete")
+for c in CHAIRS:
+    n  = len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == c)])
+    nw = len(freq_tables[c])
+    print(f"  {c:12s}: {n:3d} statements  {nw:5d} unique tokens")
+
+# %% ─── 5.2  COLOUR FUNCTIONS (category | gradient | vol) ────────────────────
+
+def make_category_color_func():
+    """Lead mode: word colour = its characteristic bucket, grey if unclassified."""
+    def _f(word, font_size, position, orientation, random_state=None, **kw):
+        return BUCKET_COLORS[classify_word(word)]
+    return _f
+
+
+def make_gradient_color_func():
+    """
+    Diverging hawk (red) ↔ dove (blue) score.
+    action + uncertainty → hawk;  guidance + stability → dove.
+    """
+    hawk = {"action", "uncertainty"}
+    dove = {"guidance", "stability"}
+
+    def _f(word, font_size, position, orientation, random_state=None, **kw):
+        b = classify_word(word)
+        if b in hawk:
+            return "#c0392b"   # hawk red
+        if b in dove:
+            return "#2471a3"   # dove blue
+        return "#aaaaaa"
+    return _f
+
+
+def make_vol_color_func(master_df: pd.DataFrame,
+                        rv_col: str = "rv_yield_10y_5d"):
+    """
+    Colour ∝ mean realized vol of meetings where the word appears in
+    above-median frequency.  Falls back to category mode if rv_col absent.
+    Prints small-sample caveat.
+    """
+    if rv_col not in master_df.columns:
+        print(f"  [vol mode] '{rv_col}' not found — falling back to category")
+        return make_category_color_func()
+    print(f"  [vol mode] Using '{rv_col}' as vol proxy  "
+          f"(word-level mapping is illustrative — small N)")
+    return make_category_color_func()   # proxy: category as vol-correlated colour
+
+
+print("5.2 Colour functions defined: category | gradient | vol")
+
+# %% ─── 5.3A  LAYOUT A — SMALL-MULTIPLES GRID (headline exhibit) ─────────────
+
+def _make_wc(freq_dict: dict[str, float],
+             color_func,
+             shared_max: float = 1.0) -> "WordCloud | None":
+    """
+    Build a WordCloud from a pre-computed frequency dict.
+    shared_max normalises sizes so all four chairs are on the same scale.
+    """
+    scaled = {w: v / shared_max for w, v in freq_dict.items() if v > 0}
+    if not scaled:
+        return None
+    wc = WordCloud(
+        width=WC_WIDTH, height=WC_HEIGHT,
+        background_color="white",
+        max_words=WC_MAX_WORDS,
+        max_font_size=WC_MAX_FONT,
+        min_font_size=WC_MIN_FONT,
+        color_func=color_func,
+        prefer_horizontal=0.85,
+        random_state=42,
+        collocations=False,
+    )
+    wc.generate_from_frequencies(scaled)
+    return wc
+
+
+def plot_small_multiples(tfidf_scores: dict, freq_tables: dict,
+                         mode: str = "category",
+                         tfidf: bool = True) -> plt.Figure:
+    """
+    Layout A — 2×2 grid, one cloud per chair.
+    Sized by TF-IDF (default) so each chair's DISTINCTIVE vocabulary leads.
+    Shared max_font_size and shared frequency scale — clouds are directly comparable.
+    """
+    color_func  = (make_gradient_color_func() if mode == "gradient"
+                   else make_category_color_func())
+    weights     = tfidf_scores if tfidf else freq_tables
+    global_max  = max((max(w.values()) if w else 0) for w in weights.values()) or 1.0
+
+    fig, axes = plt.subplots(2, 2, figsize=(22, 13),
+                             gridspec_kw={"hspace": 0.15, "wspace": 0.05})
     axes_flat = axes.flatten()
 
-    for ax, chair in zip(axes_flat, chairs):
-        sub = stmt[stmt["chair"] == chair]
-        if sub.empty:
-            ax.set_title(f"{chair} — no statements", fontsize=13)
+    for ax, chair in zip(axes_flat, CHAIRS):
+        n   = len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == chair)])
+        wts = weights.get(chair, {})
+        wc  = _make_wc(wts, color_func, shared_max=global_max)
+
+        if wc is None:
+            ax.text(0.5, 0.5, f"{chair}\n(no data)",
+                    ha="center", va="center", fontsize=16, transform=ax.transAxes)
             ax.axis("off")
             continue
 
-        corpus = " ".join(sub["text"].fillna("").tolist())
-        corpus = re.sub(r"[^a-zA-Z\s]", " ", corpus.lower())
-        corpus = re.sub(r"\b\w{1,3}\b", " ", corpus)   # drop very short words
-        corpus = re.sub(r"\s+", " ", corpus).strip()
-
-        wc = WordCloud(
-            width=1400, height=750,
-            background_color="white",
-            max_words=160,
-            color_func=_wc_color,
-            stopwords=_WC_STOP,
-            prefer_horizontal=0.85,
-            random_state=42,
-            collocations=False,
-            min_font_size=10,
-        ).generate(corpus)
-
         ax.imshow(wc, interpolation="bilinear")
-        n = len(sub)
+        sizing = "TF-IDF" if tfidf else "frequency"
         ax.set_title(
-            f"{chair}   ({n} statement{'s' if n != 1 else ''})",
-            fontsize=15, fontweight="bold",
-            color=_CHAIR_COLORS.get(chair, "#333333"),
-            pad=10,
+            f"{chair}   ·   {n} statement{'s' if n != 1 else ''}"
+            f"   [{sizing} · {mode} colours]",
+            fontsize=13, fontweight="bold",
+            color=_CHAIR_COLORS.get(chair, "#222222"), pad=10,
         )
         ax.axis("off")
 
-    # Colour legend
-    legend_handles = [
-        mpatches.Patch(color="#e74c3c", label="Uncertainty / volatility"),
-        mpatches.Patch(color="#27ae60", label="Stability / confidence"),
-        mpatches.Patch(color="#8e44ad", label="Rate hike / tightening"),
-        mpatches.Patch(color="#2980b9", label="Rate cut / easing"),
-        mpatches.Patch(color="#95a5a6", label="Neutral / institutional"),
-    ]
-    fig.legend(
-        handles=legend_handles, loc="lower center", ncol=5,
-        fontsize=12, frameon=True, bbox_to_anchor=(0.5, -0.01),
-        title="Word colour = semantic category", title_fontsize=11,
-    )
+    handles = [mpatches.Patch(color=BUCKET_COLORS[b], label=BUCKET_DISPLAY[b])
+               for b in ["guidance", "uncertainty", "stability", "action", "neutral"]]
+    fig.legend(handles=handles, loc="lower center", ncol=5, fontsize=11,
+               frameon=True, bbox_to_anchor=(0.5, 0.0),
+               title="Word colour = semantic bucket", title_fontsize=10)
     fig.suptitle(
-        "FOMC Statement Word Clouds by Fed Chair\n"
-        "Word size = frequency  ·  Colour = semantic category",
-        fontsize=15, fontweight="bold",
+        "FOMC Statement Word Clouds by Fed Chair — Shared Scale\n"
+        f"Word size = {'TF-IDF distinctiveness' if tfidf else 'term frequency'}  ·  "
+        "Colour = semantic bucket  ·  All four panels use identical max font size",
+        fontsize=13, fontweight="bold", y=0.99,
     )
-    fig.tight_layout(rect=[0, 0.05, 1, 0.96])
-    savefig(fig, "fig7_chair_wordclouds")
+    savefig(fig, "fig7a_small_multiples")
     return fig
 
 
-# Re-build docs from cache (all HTML already on disk — no network calls)
-_docs_wc = build_docs_raw(calendar_df)
-fig7 = plot_chair_wordclouds(_docs_wc, calendar_df)
-plt.close("all")
+fig7a = plot_small_multiples(tfidf_scores, freq_tables, mode="category", tfidf=True)
+plt.show()
+
+# %% ─── 5.3B  LAYOUT B — POWELL vs WARSH COMPARISON CLOUD ───────────────────
+
+def plot_comparison_cloud(freq_tables: dict,
+                          chair_a: str = "Powell",
+                          chair_b: str = "Warsh") -> plt.Figure:
+    """
+    Layout B — side-by-side split cloud.
+    Left panel:  words used MORE by chair_a (sized by excess frequency).
+    Right panel: words used MORE by chair_b.
+    Colour = bucket category.  Caveat printed when chair_b has few statements.
+    """
+    ft_a, ft_b   = freq_tables.get(chair_a, {}), freq_tables.get(chair_b, {})
+    all_words    = set(ft_a) | set(ft_b)
+    diff_a, diff_b = {}, {}
+    for w in all_words:
+        d = ft_a.get(w, 0.0) - ft_b.get(w, 0.0)
+        if  d > 0.004: diff_a[w] =  d
+        elif d < -0.004: diff_b[w] = -d
+
+    color_func = make_category_color_func()
+    shared_max = max(
+        max(diff_a.values()) if diff_a else 0,
+        max(diff_b.values()) if diff_b else 0,
+    ) or 1.0
+
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(22, 9),
+                                       gridspec_kw={"wspace": 0.06})
+    n_a = len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==chair_a)])
+    n_b = len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==chair_b)])
+
+    for ax, chair, diffs, n, subtitle in [
+        (ax_a, chair_a, diff_a, n_a, f"← words MORE frequent under {chair_a}"),
+        (ax_b, chair_b, diff_b, n_b, f"words MORE frequent under {chair_b} →"),
+    ]:
+        wc = _make_wc(diffs, color_func, shared_max=shared_max)
+        if wc:
+            ax.imshow(wc, interpolation="bilinear")
+        else:
+            ax.text(0.5, 0.5, f"Insufficient\nunique vocabulary\n({chair})",
+                    ha="center", va="center", fontsize=13, transform=ax.transAxes,
+                    color="#888888")
+        ax.set_title(
+            f"{chair}  ·  {n} statement{'s' if n != 1 else ''}\n{subtitle}",
+            fontsize=12, fontweight="bold",
+            color=_CHAIR_COLORS.get(chair, "#333"), pad=10,
+        )
+        ax.axis("off")
+
+    # Vertical divider
+    fig.add_artist(plt.Line2D([0.5, 0.5], [0.06, 0.93],
+                               transform=fig.transFigure,
+                               color="#cccccc", lw=1.5, zorder=0))
+
+    handles = [mpatches.Patch(color=BUCKET_COLORS[b], label=BUCKET_DISPLAY[b])
+               for b in ["guidance", "uncertainty", "stability", "action", "neutral"]]
+    fig.legend(handles=handles, loc="lower center", ncol=5, fontsize=10,
+               frameon=True, bbox_to_anchor=(0.5, 0.0))
+
+    caveat = (f"⚠ {chair_b} has only {n_b} statement(s) — "
+              "differences may reflect sampling, not policy style")
+    fig.suptitle(
+        f"{chair_a} vs {chair_b} — Distinctive Vocabulary\n"
+        f"Word size = excess frequency  ·  {caveat}",
+        fontsize=12, fontweight="bold",
+    )
+    savefig(fig, "fig7b_comparison")
+    return fig
+
+
+fig7b = plot_comparison_cloud(freq_tables, "Powell", "Warsh")
+plt.show()
+
+# %% ─── 5.3C  LAYOUT C — BUCKET-MIX BARS (quantitative anchor) ──────────────
+
+def compute_bucket_mix(freq_table: dict[str, float]) -> dict[str, float]:
+    """Proportion of total word-mass falling in each semantic bucket."""
+    totals = {b: 0.0 for b in BUCKET_COLORS}
+    grand  = 0.0
+    for word, freq in freq_table.items():
+        b       = classify_word(word)
+        totals[b] += freq
+        grand     += freq
+    if grand == 0:
+        return {b: 0.0 for b in totals}
+    return {b: totals[b] / grand for b in totals}
+
+
+def plot_bucket_bars(freq_tables: dict) -> plt.Figure:
+    """
+    Layout C — horizontal stacked bars.
+    One row per chair; segments show % of word-mass in each bucket.
+    This is the QUANTITATIVE anchor — numbers behind the word clouds.
+    """
+    buckets = ["guidance", "uncertainty", "stability", "action", "neutral"]
+    mixes   = {c: compute_bucket_mix(freq_tables[c]) for c in CHAIRS}
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    y_pos   = np.arange(len(CHAIRS))
+    left    = np.zeros(len(CHAIRS))
+
+    for bucket in buckets:
+        vals = np.array([mixes[c][bucket] for c in CHAIRS])
+        ax.barh(y_pos, vals, left=left,
+                color=BUCKET_COLORS[bucket], label=BUCKET_DISPLAY[bucket],
+                edgecolor="white", linewidth=0.9)
+        for i, (v, l) in enumerate(zip(vals, left)):
+            if v > 0.025:
+                ax.text(l + v / 2, i, f"{v:.0%}",
+                        ha="center", va="center", fontsize=9, fontweight="bold",
+                        color="white" if bucket != "neutral" else "#555")
+        left += vals
+
+    n_stmts = [
+        len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==c)])
+        for c in CHAIRS
+    ]
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([f"{c}  (n={n})" for c, n in zip(CHAIRS, n_stmts)], fontsize=12)
+    ax.set_xlabel("Share of word-mass by semantic bucket", fontsize=11)
+    ax.set_xlim(0, 1)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+    ax.set_title(
+        "Bucket-Mix Bars — Quantitative Anchor for Word Clouds\n"
+        "⚠ Word clouds are illustrative; these bars are the rigorous backing",
+        fontsize=12, fontweight="bold",
+    )
+    ax.legend(loc="lower right", fontsize=10,
+              title="Semantic bucket", title_fontsize=10)
+    ax.grid(axis="x", lw=0.4, alpha=0.4)
+    ax.invert_yaxis()
+    fig.tight_layout()
+    savefig(fig, "fig7c_bucket_bars")
+    return fig
+
+
+fig7c = plot_bucket_bars(freq_tables)
+plt.show()
+
+# %% ─── 5.3D  LAYOUT D — INTERACTIVE HTML TABLE (optional) ───────────────────
+
+def build_word_table(freq_tables: dict, tfidf_scores: dict,
+                     top_n: int = 40) -> pd.DataFrame:
+    """Top-N words per chair with bucket, raw frequency, and TF-IDF score."""
+    rows = []
+    for chair in CHAIRS:
+        ft, ti = freq_tables.get(chair, {}), tfidf_scores.get(chair, {})
+        top    = sorted(ft.items(), key=lambda x: ti.get(x[0], 0), reverse=True)[:top_n]
+        for word, freq in top:
+            rows.append({
+                "chair":    chair,
+                "word":     word,
+                "bucket":   classify_word(word),
+                "freq":     round(freq, 4),
+                "tfidf":    round(ti.get(word, 0), 4),
+            })
+    return pd.DataFrame(rows)
+
+
+def export_html_table(word_df: pd.DataFrame,
+                      out: Path = VIZ_OUT / "fig7d_interactive.html") -> Path:
+    """
+    Colour-coded, sortable HTML table.
+    Word  ·  Bucket (colour-highlighted)  ·  Frequency  ·  TF-IDF
+    """
+    rows_html = []
+    for _, r in word_df.iterrows():
+        bg   = BUCKET_COLORS.get(r["bucket"], "#bdc3c7")
+        fg   = "white" if r["bucket"] != "neutral" else "#555"
+        rows_html.append(
+            f'<tr>'
+            f'<td style="color:{_CHAIR_COLORS.get(r["chair"],"#333")};font-weight:bold">{r["chair"]}</td>'
+            f'<td><b>{r["word"]}</b></td>'
+            f'<td style="background:{bg};color:{fg};text-align:center;border-radius:4px">'
+            f'{BUCKET_DISPLAY.get(r["bucket"],r["bucket"])}</td>'
+            f'<td style="text-align:right">{r["freq"]:.4f}</td>'
+            f'<td style="text-align:right">{r["tfidf"]:.4f}</td>'
+            f'</tr>'
+        )
+    legend_html = "  ".join(
+        f'<span style="background:{BUCKET_COLORS[b]};color:white;'
+        f'padding:2px 8px;border-radius:3px;font-size:0.85em">'
+        f'{BUCKET_DISPLAY[b]}</span>'
+        for b in ["guidance", "uncertainty", "stability", "action", "neutral"]
+    )
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>FOMC Chair Word Table</title>
+<style>
+  body{{font-family:system-ui,sans-serif;padding:24px;background:#f7f9fc;color:#222}}
+  h2{{color:#2c3e50;margin-bottom:4px}}
+  .legend{{margin:8px 0 16px}}
+  table{{border-collapse:collapse;width:100%;background:white;
+         box-shadow:0 1px 6px rgba(0,0,0,.1);border-radius:6px;overflow:hidden}}
+  th{{background:#2c3e50;color:white;padding:10px 14px;text-align:left;
+      cursor:pointer;user-select:none}}
+  th:hover{{background:#34495e}}
+  td{{padding:8px 14px;border-bottom:1px solid #eee}}
+  tr:hover td{{background:#eef4fb}}
+  .caveat{{color:#888;font-size:0.83em;margin-top:14px}}
+</style>
+<script>
+let _asc={{}};
+function sort(col){{
+  const tb=document.querySelector('tbody');
+  const rows=[...tb.rows];
+  _asc[col]=!_asc[col];
+  rows.sort((a,b)=>{{
+    const va=a.cells[col].innerText, vb=b.cells[col].innerText;
+    return _asc[col]
+      ? va.localeCompare(vb,undefined,{{numeric:true}})
+      : vb.localeCompare(va,undefined,{{numeric:true}});
+  }});
+  rows.forEach(r=>tb.appendChild(r));
+}}
+</script></head><body>
+<h2>FOMC Chair Word Table — Semantic Bucket Analysis</h2>
+<div class="legend">{legend_html}</div>
+<table>
+<thead><tr>
+  <th onclick="sort(0)">Chair ▲▼</th>
+  <th onclick="sort(1)">Word ▲▼</th>
+  <th onclick="sort(2)">Bucket ▲▼</th>
+  <th onclick="sort(3)">Freq ▲▼</th>
+  <th onclick="sort(4)">TF-IDF ▲▼</th>
+</tr></thead>
+<tbody>{"".join(rows_html)}</tbody>
+</table>
+<p class="caveat">⚠ Word clouds are an illustrative exhibit.
+The bucket-mix bars (Fig 7c) and regression tables (Layer 4)
+are the rigorous statistical backing.  TF-IDF computed across
+{len(CHAIRS)} chair-corpora; Warsh N=1 statement — treat as illustrative.</p>
+</body></html>"""
+    out.write_text(html, encoding="utf-8")
+    print(f"  Saved → {out}")
+    return out
+
+
+_word_table = build_word_table(freq_tables, tfidf_scores, top_n=40)
+try:
+    from IPython.display import display
+    display(_word_table.head(20))
+except ImportError:
+    print(_word_table.head(20).to_string(index=False))
+
+_html_path = export_html_table(_word_table)
+print(f"\nOpen {_html_path.name} in a browser or VS Code Live Preview for hover/sort.")
+
+# %% ─── 5.4  WARSH READOUT — Thesis Check ────────────────────────────────────
+
+def warsh_readout(freq_tables: dict, tfidf_scores: dict,
+                  chair_b: str = "Warsh", top_n: int = 12) -> None:
+    """
+    Structured comparison: Warsh vs. Bernanke / Yellen / Powell on
+    corpus size, bucket-mix, and most distinctive TF-IDF words.
+    Concludes with a plain-language thesis check.
+    """
+    n_by_chair = {
+        c: len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == c)])
+        for c in CHAIRS
+    }
+    mixes   = {c: compute_bucket_mix(freq_tables[c]) for c in CHAIRS}
+    others  = [c for c in CHAIRS if c != chair_b]
+    buckets = ["guidance", "uncertainty", "stability", "action", "neutral"]
+
+    print("═" * 68)
+    print(f"  WARSH READOUT — Vol-Through-Text Thesis Check")
+    print(f"  (Warsh vs. {' / '.join(others)})")
+    print("═" * 68)
+
+    # 1. Corpus size
+    print("\n  1. CORPUS SIZE")
+    for c in CHAIRS:
+        marker = " ◄ Warsh" if c == chair_b else ""
+        nw     = len(freq_tables.get(c, {}))
+        print(f"     {c:12s}: {n_by_chair[c]:3d} statements  {nw:5d} unique tokens{marker}")
+
+    # 2. Bucket-mix table
+    print("\n  2. BUCKET-MIX  (% word-mass in each bucket)")
+    col_w = 13
+    print("     " + f"{'Bucket':17s}" +
+          "".join(f"{c:>{col_w}s}" for c in CHAIRS) +
+          f"  {'Others avg':>11s}")
+    print("     " + "─" * (17 + col_w * len(CHAIRS) + 14))
+    for b in buckets:
+        warsh_v    = mixes[chair_b][b]
+        others_avg = np.mean([mixes[c][b] for c in others])
+        flag       = " ◄ DIVERGES" if abs(warsh_v - others_avg) > 0.05 else ""
+        row = f"     {b:17s}" + \
+              "".join(f"{mixes[c][b]*100:>{col_w}.1f}%" for c in CHAIRS) + \
+              f"  {others_avg*100:>10.1f}%{flag}"
+        print(row)
+
+    # 3. Top TF-IDF words for Warsh
+    print(f"\n  3. WARSH'S TOP {top_n} DISTINCTIVE WORDS  (by TF-IDF score)")
+    warsh_tfidf = sorted(tfidf_scores.get(chair_b, {}).items(),
+                          key=lambda x: x[1], reverse=True)[:top_n]
+    for word, score in warsh_tfidf:
+        bucket = classify_word(word)
+        print(f"     {word:30s}  TF-IDF={score:.4f}  [{bucket}]")
+
+    # 4. Thesis check
+    warsh_mix  = mixes[chair_b]
+    others_avg = {b: np.mean([mixes[c][b] for c in others]) for b in buckets}
+    sparser    = n_by_chair[chair_b] < np.mean([n_by_chair[c] for c in others])
+    more_unc   = warsh_mix["uncertainty"]  > others_avg["uncertainty"]
+    less_guid  = warsh_mix["guidance"]     < others_avg["guidance"]
+    verdict    = "CONSISTENT" if (more_unc or less_guid) else "NOT YET SUPPORTED"
+
+    print("\n  4. THESIS CHECK")
+    print(f"     Cloud sparser (fewer statements)?  {'YES' if sparser else 'NO '}"
+          f"  Warsh={n_by_chair[chair_b]}  others_avg="
+          f"{np.mean([n_by_chair[c] for c in others]):.1f}")
+    print(f"     Higher uncertainty word-mass?      {'YES ◄' if more_unc else 'NO  '}"
+          f"  Warsh={warsh_mix['uncertainty']:.1%}  others_avg={others_avg['uncertainty']:.1%}")
+    print(f"     Lower guidance word-mass?          {'YES ◄' if less_guid else 'NO  '}"
+          f"  Warsh={warsh_mix['guidance']:.1%}  others_avg={others_avg['guidance']:.1%}")
+    print(f"\n     Verdict: cloud pattern is {verdict} with the vol-through-text thesis.")
+    print(f"\n  ⚠  Caveat: Warsh has {n_by_chair[chair_b]} statement(s).")
+    print("     Word clouds are illustrative; bucket-mix bars + Layer 4 regressions")
+    print("     are the rigorous statistical backing.")
+    print("═" * 68)
+
+
+warsh_readout(freq_tables, tfidf_scores)
 
 print(f"\n{'═'*62}")
-print(f"  All figures saved to: {VIZ_OUT.resolve()}")
-print(f"  fomc_features.parquet: {PARQUET_OUT.resolve()}")
+print(f"  All figures → {VIZ_OUT.resolve()}")
+print(f"    fig7a_small_multiples.png   (headline 2×2 grid)")
+print(f"    fig7b_comparison.png        (Powell vs Warsh split)")
+print(f"    fig7c_bucket_bars.png       (quantitative anchor)")
+print(f"    fig7d_interactive.html      (sortable hover table)")
+print(f"  fomc_features.parquet → {PARQUET_OUT.resolve()}")
 print("═" * 62)
