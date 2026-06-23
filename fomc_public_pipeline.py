@@ -2536,11 +2536,449 @@ def warsh_readout(freq_tables: dict, tfidf_scores: dict,
 
 warsh_readout(freq_tables, tfidf_scores)
 
+# %% [markdown]
+# ---
+# # LAYER 7 — WORD-VOL CORRELATION & WARSH BACKTEST
+#
+# **Goal:** find which specific words in Fed statements correlate with realized
+# volatility, then use that signal to backtest whether Warsh's June 2026 language
+# predicted the elevated event-day vol he delivered.
+#
+# **Training universe:** 132 historical meetings (Bernanke / Yellen / Powell).
+# **Out-of-sample test:** Warsh June 17, 2026 — 1 meeting, truly held-out.
+#
+# | Output | What it shows |
+# |--------|---------------|
+# | Fig 8a | Top-40 word–GK vol correlations (bar chart, colour = bucket) |
+# | Fig 8b | NLP feature × vol metric correlation heatmap |
+# | Fig 8c | Ridge-predicted vs actual vol; Warsh backtest annotated |
+# | Readout | Top signal words from Warsh's statement; predicted vs actual |
+
+# %% ── 7.0  Build word × meeting TF-IDF matrix ────────────────────────────────
+
+from sklearn.feature_extraction.text import TfidfVectorizer as _TfidfVecL7
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_predict, KFold
+from sklearn.metrics import r2_score, mean_absolute_error
+from scipy.stats import pearsonr as _pearsonr
+
+_VOL_TARGETS = [c for c in ["gk_vol_10y", "rv_yield_10y_5d", "rv_yield_10y_10d"]
+                if c in master.columns]
+
+
+def _build_word_vol_matrix(docs_df: pd.DataFrame,
+                           master_df: pd.DataFrame,
+                           min_df: int = 5,
+                           max_features: int = 1200) -> tuple:
+    """
+    Align statement text with vol targets, vectorize to TF-IDF.
+
+    Returns
+    -------
+    X_df        : DataFrame (n_meetings × vocab), TF-IDF weights
+    vol_df      : DataFrame (n_meetings × vol_targets)
+    chairs      : Series aligned to rows
+    vectorizer  : fitted TfidfVectorizer
+    """
+    stmt = (docs_df[docs_df["doc_type"] == "statement"][["meeting_date", "text"]]
+            .copy())
+    stmt["meeting_date"] = pd.to_datetime(stmt["meeting_date"])
+
+    m = master_df[["meeting_date", "chair"] + _VOL_TARGETS].copy()
+    m["meeting_date"] = pd.to_datetime(m["meeting_date"])
+    merged = stmt.merge(m, on="meeting_date", how="inner").sort_values("meeting_date")
+
+    vec = _TfidfVecL7(
+        preprocessor=_clean,
+        tokenizer=lambda t: _tokenise(t, bigrams=False),
+        token_pattern=None,
+        min_df=min_df,
+        max_features=max_features,
+        sublinear_tf=True,
+        ngram_range=(1, 2),   # include bigrams for phrases
+    )
+    X_sp = vec.fit_transform(merged["text"].fillna(""))
+    X_df = pd.DataFrame(X_sp.toarray(),
+                        columns=vec.get_feature_names_out(),
+                        index=pd.to_datetime(merged["meeting_date"].values))
+    vol_df = merged[["meeting_date"] + _VOL_TARGETS].set_index(
+        pd.to_datetime(merged["meeting_date"].values))
+    chairs = merged.set_index(
+        pd.to_datetime(merged["meeting_date"].values))["chair"]
+    return X_df, vol_df, chairs, vec
+
+
+def _word_vol_corrs(X_df: pd.DataFrame, y: pd.Series,
+                    min_meetings: int = 5) -> pd.DataFrame:
+    """Pearson r between each word's TF-IDF weight and y across meetings."""
+    common = X_df.index.intersection(y.dropna().index)
+    Xs, ys = X_df.loc[common], y.loc[common]
+    rows = []
+    for word in Xs.columns:
+        x = Xs[word].values
+        if (x > 0).sum() < min_meetings:
+            continue
+        r, p = _pearsonr(x, ys.values)
+        rows.append({"word": word, "r": r, "p": p,
+                     "bucket": classify_word(word),
+                     "n": int((x > 0).sum())})
+    return (pd.DataFrame(rows)
+              .assign(abs_r=lambda d: d["r"].abs())
+              .sort_values("abs_r", ascending=False)
+              .reset_index(drop=True))
+
+
+# Build matrix
+X_df, vol_df, chairs, _vec7 = _build_word_vol_matrix(_wc_docs, master)
+
+_hist_mask  = chairs != "Warsh"
+_warsh_mask = chairs == "Warsh"
+X_hist      = X_df[_hist_mask]
+X_warsh     = X_df[_warsh_mask]
+vol_hist     = vol_df[_hist_mask]
+vol_warsh    = vol_df[_warsh_mask]
+
+print(f"Matrix: {X_df.shape}  vocab  |  historical={_hist_mask.sum()}  warsh={_warsh_mask.sum()}")
+print(f"Vol targets: {_VOL_TARGETS}")
+
+# %% ── 7.1  Fig 8a — Top-40 word–vol correlations ────────────────────────────
+
+def plot_word_vol_corr(corr_df: pd.DataFrame,
+                       vol_label: str = "GK event-day vol",
+                       top_n: int = 20) -> plt.Figure:
+    """
+    Diverging bar chart: top_n high-vol words (right, red shades) and
+    top_n low-vol words (left, blue shades), coloured by semantic bucket.
+    """
+    pos = corr_df[corr_df["r"] > 0].head(top_n)
+    neg = corr_df[corr_df["r"] < 0].head(top_n)
+    plot_df = pd.concat([neg.iloc[::-1], pos]).reset_index(drop=True)
+
+    colors = [BUCKET_COLORS.get(b, "#bdc3c7") for b in plot_df["bucket"]]
+    y_pos  = np.arange(len(plot_df))
+
+    fig, ax = plt.subplots(figsize=(13, max(8, len(plot_df) * 0.38)))
+    bars = ax.barh(y_pos, plot_df["r"], color=colors, alpha=0.82, edgecolor="white")
+
+    ax.axvline(0, color="#333333", lw=0.9)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(
+        [f"{r['word']}  (n={r['n']})" for _, r in plot_df.iterrows()],
+        fontsize=8,
+    )
+    ax.set_xlabel(f"Pearson r  with  {vol_label}", fontsize=10)
+    ax.set_title(
+        f"Top {top_n} Words Correlated with {vol_label}\n"
+        "Training universe: Bernanke / Yellen / Powell  ·  "
+        "Word must appear in ≥5 meetings",
+        fontsize=11, fontweight="bold",
+    )
+
+    # Annotate r values on bars
+    for bar, r_val in zip(bars, plot_df["r"]):
+        x = bar.get_width()
+        ax.text(x + (0.003 if x >= 0 else -0.003), bar.get_y() + bar.get_height() / 2,
+                f"{r_val:+.3f}", va="center",
+                ha="left" if x >= 0 else "right", fontsize=7)
+
+    # Legend
+    handles = [mpatches.Patch(color=BUCKET_COLORS[b], alpha=0.8, label=BUCKET_DISPLAY[b])
+               for b in ["guidance", "uncertainty", "stability", "action", "neutral"]]
+    ax.legend(handles=handles, fontsize=8, loc="lower right")
+    ax.grid(axis="x", lw=0.4, alpha=0.4)
+    fig.tight_layout()
+    savefig(fig, "fig8a_word_vol_corr")
+    return fig
+
+
+_corrs_gk = _word_vol_corrs(X_hist, vol_hist["gk_vol_10y"]) if "gk_vol_10y" in vol_hist else pd.DataFrame()
+if not _corrs_gk.empty:
+    fig8a = plot_word_vol_corr(_corrs_gk, vol_label="GK event-day vol", top_n=20)
+    plt.show()
+    print(f"\nTop 10 HIGH-vol words:")
+    print(_corrs_gk[_corrs_gk["r"] > 0].head(10)[["word","r","p","bucket","n"]].to_string(index=False))
+    print(f"\nTop 10 LOW-vol words:")
+    print(_corrs_gk[_corrs_gk["r"] < 0].head(10)[["word","r","p","bucket","n"]].to_string(index=False))
+
+# %% ── 7.2  Fig 8b — Feature × vol heatmap ───────────────────────────────────
+
+def plot_feature_vol_heatmap(master_df: pd.DataFrame) -> plt.Figure:
+    """
+    Pearson correlation matrix: NLP features (rows) × vol metrics (cols).
+    Diverging palette centred at zero; annotated with r values.
+    Historical meetings only (Warsh excluded so Warsh shows as OOS in Fig 8c).
+    """
+    feat_cols = [c for c in VOL_FEATURES + ["polarity_hd", "word_count"]
+                 if c in master_df.columns]
+    vol_cols  = [c for c in _VOL_TARGETS if c in master_df.columns]
+
+    sub = master_df[master_df["chair"] != "Warsh"][feat_cols + vol_cols].dropna(how="all")
+
+    # Build corr matrix manually
+    mat = pd.DataFrame(index=feat_cols, columns=vol_cols, dtype=float)
+    for f in feat_cols:
+        for v in vol_cols:
+            valid = sub[[f, v]].dropna()
+            if len(valid) > 5:
+                r, _ = _pearsonr(valid[f], valid[v])
+                mat.loc[f, v] = r
+            else:
+                mat.loc[f, v] = np.nan
+
+    fig, ax = plt.subplots(figsize=(max(6, len(vol_cols) * 2.5), len(feat_cols) * 0.85 + 1.5))
+    vabs = np.nanmax(np.abs(mat.values.astype(float)))
+    im   = ax.imshow(mat.values.astype(float), cmap="RdBu_r",
+                     vmin=-vabs, vmax=vabs, aspect="auto")
+    plt.colorbar(im, ax=ax, label="Pearson r", shrink=0.8)
+
+    ax.set_xticks(range(len(vol_cols)))
+    ax.set_xticklabels([c.replace("_", "\n") for c in vol_cols], fontsize=9)
+    ax.set_yticks(range(len(feat_cols)))
+    ax.set_yticklabels([c.replace("_", " ") for c in feat_cols], fontsize=9)
+
+    for i, f in enumerate(feat_cols):
+        for j, v in enumerate(vol_cols):
+            val = mat.loc[f, v]
+            if not np.isnan(val):
+                ax.text(j, i, f"{val:+.2f}", ha="center", va="center",
+                        fontsize=8, fontweight="bold",
+                        color="white" if abs(val) > 0.3 else "black")
+
+    ax.set_title("NLP Feature × Vol Metric Correlation\n"
+                 "(Historical meetings only — Bernanke / Yellen / Powell)",
+                 fontsize=11, fontweight="bold")
+    fig.tight_layout()
+    savefig(fig, "fig8b_feature_vol_heatmap")
+    return fig
+
+
+fig8b = plot_feature_vol_heatmap(master)
+plt.show()
+
+# %% ── 7.3  Ridge regression model ───────────────────────────────────────────
+
+def fit_ridge_model(X_train: pd.DataFrame,
+                    y_train: pd.Series,
+                    alpha: float = 50.0) -> tuple:
+    """
+    Ridge regression on TF-IDF word matrix.
+    alpha=50 provides strong regularisation given n≈130, p≈1200.
+    Returns (fitted_model, scaler, cv_predictions, cv_r2).
+    """
+    valid = y_train.dropna()
+    Xv    = X_train.loc[valid.index]
+    yv    = valid.values
+
+    scaler = StandardScaler(with_mean=False)
+    Xs     = scaler.fit_transform(Xv)
+
+    model  = Ridge(alpha=alpha)
+    cv     = KFold(n_splits=5, shuffle=True, random_state=42)
+    y_cv   = cross_val_predict(model, Xs, yv, cv=cv)
+    cv_r2  = r2_score(yv, y_cv)
+    cv_mae = mean_absolute_error(yv, y_cv)
+
+    model.fit(Xs, yv)   # refit on full training set
+    print(f"Ridge (α={alpha})  5-fold CV  R²={cv_r2:.3f}  MAE={cv_mae:.3f}pp")
+    return model, scaler, pd.Series(y_cv, index=valid.index), cv_r2
+
+
+def predict_warsh(model, scaler, X_warsh: pd.DataFrame,
+                  vec: _TfidfVecL7, top_n: int = 10) -> tuple:
+    """
+    Predict vol for each Warsh meeting.
+    Also returns top contributing words (coef × feature value).
+    """
+    if X_warsh.empty:
+        return pd.Series(dtype=float), {}
+
+    Xs    = scaler.transform(X_warsh)
+    preds = model.predict(Xs)
+    pred_s = pd.Series(preds, index=X_warsh.index)
+
+    # Top word contributions for most recent Warsh meeting
+    feat_vals = X_warsh.iloc[-1].values
+    contribs  = model.coef_ * scaler.scale_**-1 * feat_vals
+    word_contrib = dict(zip(X_warsh.columns, contribs))
+    top_words = sorted(word_contrib.items(), key=lambda x: abs(x[1]), reverse=True)[:top_n]
+
+    return pred_s, dict(top_words)
+
+
+# Fit on historical GK vol
+_y_gk_hist = vol_hist["gk_vol_10y"] if "gk_vol_10y" in vol_hist else pd.Series(dtype=float)
+
+if not _y_gk_hist.dropna().empty:
+    _ridge, _scaler, _cv_preds, _cv_r2 = fit_ridge_model(X_hist, _y_gk_hist)
+    _warsh_preds, _warsh_contribs       = predict_warsh(_ridge, _scaler, X_warsh, _vec7)
+else:
+    _cv_preds, _warsh_preds, _warsh_contribs = pd.Series(dtype=float), pd.Series(dtype=float), {}
+
+# %% ── 7.4  Fig 8c — Warsh backtest chart ────────────────────────────────────
+
+def plot_warsh_backtest(cv_preds: pd.Series,
+                        y_actual: pd.Series,
+                        warsh_preds: pd.Series,
+                        vol_warsh_actual: pd.Series,
+                        chairs: pd.Series) -> plt.Figure:
+    """
+    Two-panel backtest figure.
+
+    Left: Scatter of 5-fold CV predicted vs actual vol (historical).
+          Colour = chair. Warsh prediction overlaid as a star.
+    Right: Timeline — actual GK vol (dots) + model prediction (line),
+           Warsh meeting starred and labelled.
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle("Word-Based Vol Model — Warsh Out-of-Sample Backtest\n"
+                 "Trained on Bernanke / Yellen / Powell  ·  "
+                 "Warsh June 2026 is truly out-of-sample",
+                 fontsize=12, fontweight="bold")
+
+    # ── Left: predicted vs actual scatter ────────────────────────────────────
+    common = cv_preds.index.intersection(y_actual.dropna().index)
+    if len(common):
+        yp  = cv_preds.loc[common]
+        ya  = y_actual.loc[common]
+        ch  = chairs.loc[common] if common[0] in chairs.index else pd.Series("Unknown", index=common)
+
+        for chair in ["Bernanke", "Yellen", "Powell"]:
+            m = ch == chair
+            ax1.scatter(ya[m], yp[m], color=_CHAIR_COLORS.get(chair, "#888"),
+                        alpha=0.7, s=35, label=chair, zorder=3)
+
+        lim = max(ya.max(), yp.max()) * 1.05
+        ax1.plot([0, lim], [0, lim], "k--", lw=0.8, alpha=0.5, label="45° line")
+
+    # Warsh prediction
+    if not warsh_preds.empty:
+        for date, pred in warsh_preds.items():
+            actual = float(vol_warsh_actual.loc[date]) if date in vol_warsh_actual.index and not pd.isna(vol_warsh_actual.loc[date]) else None
+            if actual is not None:
+                ax1.scatter([actual], [pred], color=_CHAIR_COLORS.get("Warsh","#762a83"),
+                            s=200, marker="*", zorder=6, label=f"Warsh (OOS)")
+                ax1.annotate(f"Warsh\npred={pred:.1f}pp\nactual={actual:.1f}pp",
+                             xy=(actual, pred), xytext=(actual + 2, pred + 2),
+                             fontsize=8, color=_CHAIR_COLORS.get("Warsh","#762a83"),
+                             arrowprops=dict(arrowstyle="->", color="#762a83", lw=0.8))
+
+    ax1.set_xlabel("Actual GK vol (pp)", fontsize=10)
+    ax1.set_ylabel("Model-predicted GK vol (pp)", fontsize=10)
+    ax1.set_title(f"Predicted vs Actual  ·  5-fold CV  R²={_cv_r2:.3f}", fontsize=10)
+    ax1.legend(fontsize=8)
+    ax1.grid(lw=0.4, alpha=0.4)
+
+    # ── Right: timeline ───────────────────────────────────────────────────────
+    common2 = y_actual.dropna().index
+    if len(common2):
+        ax2.scatter(common2, y_actual.loc[common2],
+                    color=[_CHAIR_COLORS.get(chairs.get(d,"Unknown"),"#888") for d in common2],
+                    s=25, alpha=0.7, zorder=3, label="Actual GK vol")
+
+    # CV predictions for historical
+    common3 = cv_preds.index.intersection(y_actual.dropna().index)
+    if len(common3):
+        ax2.plot(sorted(common3),
+                 [cv_preds.loc[d] for d in sorted(common3)],
+                 color="#555555", lw=0.9, alpha=0.6, label="Model (CV pred.)")
+
+    # Warsh
+    if not warsh_preds.empty:
+        for date, pred in warsh_preds.items():
+            ax2.scatter([date], [pred], color=_CHAIR_COLORS.get("Warsh","#762a83"),
+                        s=250, marker="*", zorder=7, label="Warsh — model pred.")
+            actual = float(vol_warsh_actual.loc[date]) if date in vol_warsh_actual.index and not pd.isna(vol_warsh_actual.loc[date]) else None
+            if actual is not None:
+                ax2.scatter([date], [actual], color=_CHAIR_COLORS.get("Warsh","#762a83"),
+                            s=120, marker="D", zorder=7, label="Warsh — actual GK")
+                ax2.annotate(
+                    f"Warsh\n★ pred={pred:.1f}\n◆ actual={actual:.1f}",
+                    xy=(date, max(pred, actual)),
+                    xytext=(date - pd.Timedelta(days=400), max(pred, actual) + 5),
+                    fontsize=8, color=_CHAIR_COLORS.get("Warsh","#762a83"),
+                    arrowprops=dict(arrowstyle="->", color="#762a83", lw=0.8),
+                )
+
+    ax2.set_ylabel("GK event-day vol (pp annualised)", fontsize=10)
+    ax2.set_title("Timeline — Actual GK vol + Model Predictions", fontsize=10)
+    ax2.legend(fontsize=8, ncol=2)
+    ax2.grid(lw=0.4, alpha=0.4)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    savefig(fig, "fig8c_warsh_backtest")
+    return fig
+
+
+_vol_warsh_actual = vol_warsh["gk_vol_10y"] if "gk_vol_10y" in vol_warsh else pd.Series(dtype=float)
+fig8c = plot_warsh_backtest(_cv_preds, _y_gk_hist, _warsh_preds, _vol_warsh_actual, chairs)
+plt.show()
+
+# %% ── 7.5  Warsh backtest readout ───────────────────────────────────────────
+
+def warsh_vol_readout(warsh_preds: pd.Series,
+                      vol_warsh_actual: pd.Series,
+                      word_contribs: dict,
+                      cv_r2: float) -> None:
+    """
+    Print the Warsh backtest verdict: top signal words, predicted vs actual vol,
+    and whether the word-based signal called the direction correctly.
+    """
+    print("═" * 68)
+    print("  WARSH VOL BACKTEST — Word-Signal Prediction Check")
+    print(f"  Model: Ridge(α=50) on {X_hist.shape[1]}-word TF-IDF  "
+          f"·  5-fold CV R²={cv_r2:.3f}")
+    print("═" * 68)
+
+    if warsh_preds.empty:
+        print("  No Warsh meetings with data.")
+        return
+
+    for date, pred in warsh_preds.items():
+        actual     = vol_warsh_actual.get(date, np.nan)
+        hist_mean  = _y_gk_hist.dropna().mean()
+        hist_med   = _y_gk_hist.dropna().median()
+
+        print(f"\n  Meeting:  {pd.Timestamp(date).date()}")
+        print(f"  Predicted GK vol : {pred:.2f} pp")
+        print(f"  Actual GK vol    : {actual:.2f} pp" if not pd.isna(actual)
+              else "  Actual GK vol    : N/A (no market data yet)")
+        print(f"  Historical mean  : {hist_mean:.2f} pp  ·  median : {hist_med:.2f} pp")
+
+        if not pd.isna(actual):
+            err    = pred - actual
+            pct    = abs(err) / actual * 100
+            direct = "CORRECT ✓" if (pred > hist_mean) == (actual > hist_mean) else "WRONG ✗"
+            print(f"  Error            : {err:+.2f} pp  ({pct:.1f}%)")
+            print(f"  Direction call   : {direct}  "
+                  f"(predicted {'elevated' if pred>hist_mean else 'subdued'}, "
+                  f"actual {'elevated' if actual>hist_mean else 'subdued'} vol)")
+
+    print(f"\n  Top word contributions from Warsh's statement:")
+    print(f"  (coef × TF-IDF weight — positive = pushes vol forecast up)")
+    print(f"  {'Word':30s}  {'Contribution':>12s}  {'Bucket':15s}")
+    print(f"  {'─'*60}")
+    for word, contrib in sorted(word_contribs.items(), key=lambda x: abs(x[1]), reverse=True)[:15]:
+        bucket = classify_word(word)
+        print(f"  {word:30s}  {contrib:>+12.5f}  {bucket}")
+
+    print(f"\n  ⚠  Caveat: word-vol correlations estimated from N≈130 meetings.")
+    print("     Ridge model is regularised but may overfit idiosyncratic patterns.")
+    print("     Treat directional call as the signal — magnitude as illustrative.")
+    print("═" * 68)
+
+
+warsh_vol_readout(_warsh_preds, _vol_warsh_actual, _warsh_contribs, _cv_r2
+                  if '_cv_r2' in dir() else 0.0)
+
 print(f"\n{'═'*62}")
 print(f"  All figures → {VIZ_OUT.resolve()}")
 print(f"    fig7a_small_multiples.png   (headline 2×2 grid)")
 print(f"    fig7b_comparison.png        (Powell vs Warsh split)")
 print(f"    fig7c_bucket_bars.png       (quantitative anchor)")
 print(f"    fig7d_interactive.html      (sortable hover table)")
+print(f"    fig8a_word_vol_corr.png     (word-vol correlations)")
+print(f"    fig8b_feature_vol_heatmap.png (NLP × vol heatmap)")
+print(f"    fig8c_warsh_backtest.png    (Warsh OOS backtest)")
 print(f"  fomc_features.parquet → {PARQUET_OUT.resolve()}")
 print("═" * 62)
