@@ -123,8 +123,8 @@ _HARDCODED_DATES: list[str] = [
 _CHAIR_PERIODS: list[tuple[date, date, str]] = [
     (date(2010, 1,  1), date(2014, 1, 31), "Bernanke"),
     (date(2014, 2,  1), date(2018, 2,  2), "Yellen"),
-    (date(2018, 2,  3), date(2026, 2, 18), "Powell"),
-    (date(2026, 2, 19), date(2030, 1,  1), "Warsh"),   # ← adjust if needed
+    (date(2018, 2,  3), date(2026, 6, 16), "Powell"),
+    (date(2026, 6, 17), date(2030, 1,  1), "Warsh"),
 ]
 
 # Press conferences: quarterly Apr 2011–Dec 2018; every meeting Jan 2019+.
@@ -1870,6 +1870,163 @@ def plot_warsh_spotlight(df: pd.DataFrame, feature_cols: list[str]) -> plt.Figur
 
 
 fig6 = plot_warsh_spotlight(master, VOL_FEATURES)
+plt.close("all")
+
+# %% [markdown]
+# ---
+# ## Fig 7 — Fed Chair Word Clouds
+# Word size = frequency across all statements for that chair.
+# Colour encodes semantic category:
+# 🔴 Uncertainty / volatility · 🟢 Stability / confidence · 🟣 Rate hike / tightening · 🔵 Rate cut / easing · ⚫ Neutral
+
+# %% ── Fig 7: Chair word clouds ───────────────────────────────────────────────
+
+from wordcloud import WordCloud
+
+# Semantic colour map — add or adjust terms here
+_WORD_COLORS: dict[str, str] = {
+    # Uncertainty / volatility → red-orange
+    "uncertain":       "#e74c3c", "uncertainty":    "#e74c3c",
+    "volatile":        "#c0392b", "volatility":     "#c0392b",
+    "risk":            "#e67e22", "risks":          "#e67e22",
+    "turbulent":       "#c0392b", "challenging":    "#e74c3c",
+    "adverse":         "#c0392b", "downside":       "#e67e22",
+    "concern":         "#e74c3c", "concerns":       "#e74c3c",
+    "elevated":        "#e67e22", "heightened":     "#e74c3c",
+    "disruptions":     "#c0392b", "stressed":       "#c0392b",
+    "headwinds":       "#e67e22", "deteriorated":   "#c0392b",
+    "tensions":        "#e74c3c", "trade":          "#e67e22",
+    # Stability / confidence → green-teal
+    "stable":          "#27ae60", "stability":      "#27ae60",
+    "balanced":        "#2ecc71", "sustainable":    "#27ae60",
+    "anchored":        "#1abc9c", "resilient":      "#16a085",
+    "solid":           "#27ae60", "steady":         "#2ecc71",
+    "robust":          "#27ae60", "consistent":     "#1abc9c",
+    "confident":       "#27ae60", "confidence":     "#27ae60",
+    "strength":        "#2ecc71", "strong":         "#27ae60",
+    "moderate":        "#1abc9c", "gradually":      "#1abc9c",
+    "well":            "#2ecc71", "improvement":    "#27ae60",
+    # Rate hike / tightening → purple
+    "increase":        "#8e44ad", "increasing":     "#8e44ad",
+    "raised":          "#8e44ad", "raising":        "#7d3c98",
+    "restrictive":     "#6c3483", "tighten":        "#8e44ad",
+    "tightening":      "#6c3483", "higher":         "#9b59b6",
+    "normalize":       "#8e44ad", "normalization":  "#6c3483",
+    "remove":          "#7d3c98", "hike":           "#6c3483",
+    "overshoot":       "#8e44ad", "above":          "#9b59b6",
+    # Rate cut / easing → blue
+    "decrease":        "#2980b9", "lower":          "#3498db",
+    "lowering":        "#2980b9", "accommodative":  "#1a5276",
+    "easing":          "#2471a3", "ease":           "#3498db",
+    "reduce":          "#2980b9", "reducing":       "#2980b9",
+    "cut":             "#2471a3", "support":        "#5dade2",
+    "stimulus":        "#1a5276", "accommodation":  "#1a5276",
+    "below":           "#2980b9", "purchase":       "#2471a3",
+    "purchases":       "#2471a3", "asset":          "#5dade2",
+    "securities":      "#5dade2", "quantitative":   "#1a5276",
+}
+
+_NEUTRAL_COLOR = "#95a5a6"
+
+_WC_STOP = {
+    "the", "and", "for", "that", "has", "with", "will", "from", "this",
+    "have", "are", "its", "been", "was", "were", "which", "not", "but",
+    "more", "also", "than", "their", "they", "these", "would", "could",
+    "should", "may", "can", "all", "such", "over", "under", "into",
+    "about", "out", "when", "some", "our", "committee", "federal",
+    "open", "market", "voting", "voted", "reserve", "bank", "board",
+    "members", "rates", "rate", "percent", "basis", "points", "funds",
+    "range", "target", "monetary", "policy", "economic", "economy",
+    "conditions", "inflation", "employment", "labor", "growth", "year",
+    "period", "recent", "continue", "continued", "remains", "remained",
+    "expects", "expected", "consistent", "including", "determine",
+    "appropriate", "assessed", "current", "levels", "pace", "future",
+}
+
+
+def _wc_color(word, **kwargs):
+    return _WORD_COLORS.get(word.lower(), _NEUTRAL_COLOR)
+
+
+def plot_chair_wordclouds(docs_df: pd.DataFrame,
+                          calendar_df: pd.DataFrame) -> plt.Figure:
+    """
+    4-panel word cloud — one per Fed chair.
+    Word size ∝ term frequency across all that chair's statements.
+    Colour encodes semantic category via _wc_color.
+    """
+    stmt = docs_df[docs_df["doc_type"] == "statement"].copy()
+    # chair is already on docs_df; if not, join from calendar
+    if "chair" not in stmt.columns:
+        _cal = calendar_df[["meeting_date", "chair"]].copy()
+        _cal["meeting_date"] = pd.to_datetime(_cal["meeting_date"])
+        stmt["meeting_date"] = pd.to_datetime(stmt["meeting_date"])
+        stmt = stmt.merge(_cal, on="meeting_date", how="left")
+
+    chairs = ["Bernanke", "Yellen", "Powell", "Warsh"]
+    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+    axes_flat = axes.flatten()
+
+    for ax, chair in zip(axes_flat, chairs):
+        sub = stmt[stmt["chair"] == chair]
+        if sub.empty:
+            ax.set_title(f"{chair} — no statements", fontsize=13)
+            ax.axis("off")
+            continue
+
+        corpus = " ".join(sub["text"].fillna("").tolist())
+        corpus = re.sub(r"[^a-zA-Z\s]", " ", corpus.lower())
+        corpus = re.sub(r"\b\w{1,3}\b", " ", corpus)   # drop very short words
+        corpus = re.sub(r"\s+", " ", corpus).strip()
+
+        wc = WordCloud(
+            width=1400, height=750,
+            background_color="white",
+            max_words=160,
+            color_func=_wc_color,
+            stopwords=_WC_STOP,
+            prefer_horizontal=0.85,
+            random_state=42,
+            collocations=False,
+            min_font_size=10,
+        ).generate(corpus)
+
+        ax.imshow(wc, interpolation="bilinear")
+        n = len(sub)
+        ax.set_title(
+            f"{chair}   ({n} statement{'s' if n != 1 else ''})",
+            fontsize=15, fontweight="bold",
+            color=_CHAIR_COLORS.get(chair, "#333333"),
+            pad=10,
+        )
+        ax.axis("off")
+
+    # Colour legend
+    legend_handles = [
+        mpatches.Patch(color="#e74c3c", label="Uncertainty / volatility"),
+        mpatches.Patch(color="#27ae60", label="Stability / confidence"),
+        mpatches.Patch(color="#8e44ad", label="Rate hike / tightening"),
+        mpatches.Patch(color="#2980b9", label="Rate cut / easing"),
+        mpatches.Patch(color="#95a5a6", label="Neutral / institutional"),
+    ]
+    fig.legend(
+        handles=legend_handles, loc="lower center", ncol=5,
+        fontsize=12, frameon=True, bbox_to_anchor=(0.5, -0.01),
+        title="Word colour = semantic category", title_fontsize=11,
+    )
+    fig.suptitle(
+        "FOMC Statement Word Clouds by Fed Chair\n"
+        "Word size = frequency  ·  Colour = semantic category",
+        fontsize=15, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0.05, 1, 0.96])
+    savefig(fig, "fig7_chair_wordclouds")
+    return fig
+
+
+# Re-build docs from cache (all HTML already on disk — no network calls)
+_docs_wc = build_docs_raw(calendar_df)
+fig7 = plot_chair_wordclouds(_docs_wc, calendar_df)
 plt.close("all")
 
 print(f"\n{'═'*62}")
