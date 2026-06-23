@@ -830,49 +830,73 @@ def compute_rv(
 fomc_dates_list = features_text["meeting_date"].dt.date.tolist()
 rv_df = compute_rv(yields_df, fomc_dates_list)
 
-# %% ── 3c: Parkinson range-vol on the meeting day (event-day proxy) ──────────
+# %% ── 3c: Garman-Klass event-day vol (replaces Parkinson) ───────────────────
 
-def compute_parkinson_vol(fomc_dates: list, ticker: str = "^TNX") -> pd.Series:
+def compute_garman_klass_vol(fomc_dates: list, ticker: str = "^TNX") -> pd.Series:
     """
-    Parkinson (1980) range estimator on meeting-day OHLC from Yahoo Finance.
-    Parkinson_vol = sqrt(1 / (4 ln 2) * (ln(H/L))^2) * sqrt(252) * 100
+    Garman-Klass (1980) estimator on meeting-day OHLC from Yahoo Finance.
 
-    Uses ^TNX (CBOE 10Y yield index); H/L in percentage points.
-    Returns a Series indexed by meeting_date.
+    GK daily variance:
+        σ²_GK = 0.5 × ln(H/L)² − (2ln2 − 1) × ln(C/O)²
+
+    Annualised vol:
+        GK_vol = sqrt(252 × σ²_GK) × 100  (pp annualised)
+
+    ~7.4× more statistically efficient than close-to-close.
+    Captures the intraday FOMC spike (statement 2pm, presser 2:30pm ET)
+    that close-to-close can miss when the market retraces by 4pm.
+
+    H, L, C, O sourced from ^TNX (CBOE 10Y yield index, in pp).
+    Returns a Series indexed by meeting_date, named 'gk_vol_10y'.
     """
     try:
         import yfinance as yf
     except ImportError:
-        print("  yfinance not installed — Parkinson vol skipped.")
-        return pd.Series(dtype=float, name="parkinson_vol_10y")
+        print("  yfinance not installed — GK vol skipped.")
+        return pd.Series(dtype=float, name="gk_vol_10y")
 
-    cache_path = CACHE_DIR / "market" / f"ohlc_{ticker.replace('^','')}.parquet"
+    cache_path = CACHE_DIR / "market" / f"ohlc_{ticker.replace('^', '')}.parquet"
     if cache_path.exists():
         ohlc = pd.read_parquet(cache_path)
     else:
         ohlc = yf.download(ticker, start=market_start, end=market_end,
                            progress=False, auto_adjust=True)
+        # yfinance ≥0.2.18 returns MultiIndex columns — flatten to simple names
+        if isinstance(ohlc.columns, pd.MultiIndex):
+            ohlc.columns = [col[0] for col in ohlc.columns]
         ohlc.to_parquet(cache_path)
 
+    # Flatten MultiIndex if loaded from a cache written by an older yfinance version
+    if isinstance(ohlc.columns, pd.MultiIndex):
+        ohlc.columns = [col[0] for col in ohlc.columns]
+
     ohlc.index = pd.to_datetime(ohlc.index)
+    _LN2 = np.log(2)
     results = {}
+
     for fd in fomc_dates:
         fd_ts = pd.Timestamp(fd)
-        if fd_ts in ohlc.index:
-            row = ohlc.loc[fd_ts]
-            H, L = float(row["High"]), float(row["Low"])
-            if H > 0 and L > 0 and H >= L:
-                park = np.sqrt(1 / (4 * np.log(2)) * (np.log(H / L)) ** 2
-                               * 252) * 100
-                results[fd] = park
+        if fd_ts not in ohlc.index:
+            continue
+        row = ohlc.loc[fd_ts]
+        H = float(row["High"])
+        L = float(row["Low"])
+        C = float(row["Close"])
+        O = float(row["Open"])
+        if not (H > 0 and L > 0 and C > 0 and O > 0 and H >= L):
+            continue
+        sigma2 = 0.5 * (np.log(H / L)) ** 2 - (2 * _LN2 - 1) * (np.log(C / O)) ** 2
+        if sigma2 > 0:
+            results[fd] = np.sqrt(252 * sigma2) * 100
 
-    s = pd.Series(results, name="parkinson_vol_10y")
+    s = pd.Series(results, name="gk_vol_10y")
     s.index = pd.to_datetime(s.index)
-    print(f"Parkinson vol: {s.notna().sum()} meeting-day observations")
+    print(f"Garman-Klass vol: {s.notna().sum()} meeting-day observations  "
+          f"mean={s.mean():.2f}pp  median={s.median():.2f}pp")
     return s
 
 
-parkinson_s = compute_parkinson_vol(fomc_dates_list)
+gk_s = compute_garman_klass_vol(fomc_dates_list)
 
 # %% ── 3d: Policy-surprise proxy (2Y yield daily change) ─────────────────────
 
@@ -924,15 +948,15 @@ regime_df = load_regime()
 # %% ── 3f: Merge Layer 3 ──────────────────────────────────────────────────────
 
 def build_layer3(rv_df: pd.DataFrame,
-                 parkinson: pd.Series,
+                 gk_vol: pd.Series,
                  policy_surprise: pd.Series,
                  regime: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Join all Layer 3 frames on meeting_date."""
     base = rv_df.set_index("meeting_date")
 
-    park_df = parkinson.to_frame()
-    park_df.index = pd.to_datetime(park_df.index)
-    base = base.join(park_df, how="left")
+    gk_df = gk_vol.to_frame()
+    gk_df.index = pd.to_datetime(gk_df.index)
+    base = base.join(gk_df, how="left")
 
     ps_df = policy_surprise.to_frame()
     ps_df.index = pd.to_datetime(ps_df.index)
@@ -950,7 +974,7 @@ def build_layer3(rv_df: pd.DataFrame,
     return base
 
 
-layer3_df = build_layer3(rv_df, parkinson_s, policy_surprise_s, regime_df)
+layer3_df = build_layer3(rv_df, gk_s, policy_surprise_s, regime_df)
 
 # %% [markdown]
 # ---
@@ -1065,11 +1089,11 @@ for k in RV_WINDOWS:
     if res is not None:
         reg_results[f"rv_{k}d"] = res
 
-# Event-day Parkinson vol
-if "parkinson_vol_10y" in master.columns:
+# Event-day Garman-Klass vol
+if "gk_vol_10y" in master.columns:
     run_hac_regression(
-        master, "parkinson_vol_10y", VOL_FEATURES, CONTROLS,
-        hac_lags=5, label="Parkinson event-day vol (10Y)",
+        master, "gk_vol_10y", VOL_FEATURES, CONTROLS,
+        hac_lags=5, label="Garman-Klass event-day vol (10Y)",
     )
 
 # %% ── 4c: Regime interactions ───────────────────────────────────────────────
@@ -1446,7 +1470,7 @@ OUTPUT_COLS = (
     ["meeting_date", "chair", "presser_available"]
     + TEXT_FEATURE_COLS
     + [c for c in master.columns if c.startswith("rv_")]
-    + ["parkinson_vol_10y", "policy_surprise_2y_chg", "regime_id"]
+    + ["gk_vol_10y", "policy_surprise_2y_chg", "regime_id"]
 )
 OUTPUT_COLS = [c for c in OUTPUT_COLS if c in master.columns]
 
@@ -1470,7 +1494,7 @@ print("""
 │  COLUMNS TO REPLACE (public proxies → Bloomberg actuals):  │
 │    rv_yield_*_*d        → Bloomberg realized vol from       │
 │                           Treasury futures prices           │
-│    parkinson_vol_10y    → Bloomberg event-day range vol     │
+│    gk_vol_10y           → Bloomberg event-day GK vol        │
 │    policy_surprise_*    → SF Fed USMPD or OIS surprise      │
 │    regime_id            → regime_pl from Bloomberg session  │
 │                                                             │
