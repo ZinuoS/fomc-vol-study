@@ -1,4 +1,4 @@
-# %% [markdown]
+ # %% [markdown]
 # # FOMC Text → Volatility Features
 # **Public data only · No Bloomberg / BQuant dependency**
 # Output: `fomc_features.parquet` — portable artifact for work-laptop VRP join.
@@ -1503,6 +1503,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import TwoSlopeNorm
+plt.rcParams.update({"figure.dpi": 120, "figure.facecolor": "white"})
 
 VIZ_OUT = Path("fomc_viz")
 VIZ_OUT.mkdir(exist_ok=True)
