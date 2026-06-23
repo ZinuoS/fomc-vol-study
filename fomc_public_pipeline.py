@@ -1477,10 +1477,20 @@ OUTPUT_COLS = [c for c in OUTPUT_COLS if c in master.columns]
 fomc_features = master[OUTPUT_COLS].copy()
 fomc_features.to_parquet(PARQUET_OUT, index=False)
 
+# Save raw statement text separately for the backtest notebook (word-bag model)
+_stmt_text = (docs_raw[docs_raw["doc_type"] == "statement"]
+              [["meeting_date", "chair", "text"]]
+              .drop_duplicates("meeting_date")
+              .sort_values("meeting_date")
+              .reset_index(drop=True))
+_stmt_text["meeting_date"] = pd.to_datetime(_stmt_text["meeting_date"])
+_stmt_text.to_parquet(Path("fomc_statements.parquet"), index=False)
+
 print(f"\n{'═'*62}")
 print(f"  OUTPUT: {PARQUET_OUT}")
 print(f"  Shape : {fomc_features.shape}")
 print(f"  Cols  : {list(fomc_features.columns)}")
+print(f"  STATEMENTS: fomc_statements.parquet  ({len(_stmt_text)} rows)")
 print(f"{'═'*62}")
 
 # ── HANDOFF SUMMARY ──────────────────────────────────────────────────────────
