@@ -221,48 +221,56 @@ def _extract_statement_text(html: str) -> tuple[str, str]:
     """
     Parse Fed statement HTML.  Returns (raw_text, cleaned_text).
     Strips 'For release at...' header and 'Voting for the FOMC...' footer.
+
+    The modern Fed page has TWO col-xs-12 col-sm-8 divs:
+      1. class='heading col-xs-12 ...' — breadcrumb/title (skip)
+      2. class='col-xs-12 col-sm-8 ...' — actual statement body (use this)
+    We select the non-heading one explicitly.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Try modern layout first (2017+), then older layout
-    content = (
-        soup.find("div", class_=re.compile(r"col-xs-12.*col-sm-8"))
-        or soup.find("div", id="article")
-        or soup.find("div", id="leftText")
-        or soup.find("article")
-        or soup.body
+    # Modern layout: find content div that is NOT the heading nav div
+    content = soup.find(
+        "div",
+        class_=lambda c: c and "col-xs-12" in c and "col-sm-8" in c and "heading" not in c,
     )
+    # Fallbacks for older layouts (pre-2017) and edge cases
+    if content is None:
+        content = (
+            soup.find("div", id="article")
+            or soup.find("div", id="leftText")
+            or soup.find("article")
+            or soup.body
+        )
 
     paragraphs = [p.get_text(" ", strip=True)
                   for p in (content or soup).find_all("p")]
     raw_text = "\n\n".join(p for p in paragraphs if p)
 
-    # ── Clean: drop header and footer ────────────────────────────────────
-    lines = raw_text.splitlines()
-    body_lines: list[str] = []
+    # ── Clean: skip release-time header; stop at voting-record footer ────
+    body_paras: list[str] = []
     in_body = False
-    for line in lines:
-        lo = line.lower()
-        # Skip "For release at..." opener
-        if not in_body and re.match(r"for release at", lo):
-            in_body = True
-            continue
-        if not in_body and len(line.split()) > 5:
-            in_body = True   # start after first blank/short lines
-
-        # Stop at voting record footer
+    for para in paragraphs:
+        lo = para.lower()
+        # Stop at voting record or chair signature block
         if re.search(r"voting (for|against) the fomc", lo):
             break
         if re.search(r"^chair(man|woman|person)?[\s,]", lo):
             break
+        # Skip the "For release at 2:00 p.m." opener (re.search, not re.match)
+        if not in_body and re.search(r"for release at", lo):
+            in_body = True
+            continue
+        # Start body at first substantive paragraph (≥15 words)
+        if not in_body and len(para.split()) >= 15:
+            in_body = True
+        if in_body and len(para.split()) > 3:
+            body_paras.append(para)
 
-        if in_body:
-            body_lines.append(line)
+    cleaned = re.sub(r"\s+", " ", " ".join(body_paras)).strip()
 
-    cleaned = re.sub(r"\s+", " ", " ".join(body_lines)).strip()
-
-    # Fallback: if body is very short, return raw
-    if len(cleaned.split()) < 20:
+    # Fallback: if cleaning stripped too much, use all paragraphs
+    if len(cleaned.split()) < 20 and raw_text:
         cleaned = re.sub(r"\s+", " ", raw_text).strip()
 
     return raw_text.strip(), cleaned
@@ -361,6 +369,49 @@ def build_docs_raw(calendar: pd.DataFrame) -> pd.DataFrame:
 
 docs_raw = build_docs_raw(calendar_df)
 
+# %% ── 1e: Drop bad scrapes (JS-wall / redirect pages) ───────────────────────
+# Pages that returned a JS-disabled stub or a nav-only redirect produce very
+# short "cleaned" text (< 50 words).  Remove those rows and delete their cache
+# files so the next run re-fetches from the corrected extractor.
+
+MIN_STATEMENT_WORDS = 50
+
+def purge_bad_scrapes(docs: pd.DataFrame, min_words: int = MIN_STATEMENT_WORDS,
+                      cache_dir: Path = CACHE_DIR) -> pd.DataFrame:
+    """
+    Remove rows where cleaned text is too short, and wipe their HTML cache so
+    they are re-fetched on next run with the fixed extractor.
+    """
+    import hashlib
+    bad = docs[docs["n_words"] < min_words]
+    if bad.empty:
+        print(f"  No bad scrapes detected (all ≥ {min_words} words).")
+        return docs
+
+    print(f"  Purging {len(bad)} short-text rows (< {min_words} words):")
+    for _, row in bad.iterrows():
+        d  = row["meeting_date"]
+        dt = d.date() if hasattr(d, "date") else d
+        dt_str = dt.strftime("%Y%m%d")
+        if row["doc_type"] == "statement":
+            url = STATEMENT_URL_T.format(date=dt_str)
+        else:
+            url = PRESSCONF_URL_T.format(date=dt_str)
+        key  = hashlib.md5(url.encode()).hexdigest()[:16]
+        path = cache_dir / "html" / f"{key}.html"
+        if path.exists():
+            path.unlink()
+            print(f"    cleared cache: {dt_str} {row['doc_type']}")
+        else:
+            print(f"    no cache file: {dt_str} {row['doc_type']} (will re-fetch)")
+
+    clean = docs[docs["n_words"] >= min_words].copy().reset_index(drop=True)
+    print(f"  docs_raw after purge: {clean.shape}")
+    return clean
+
+
+docs_raw = purge_bad_scrapes(docs_raw)
+
 # %% [markdown]
 # ---
 # # LAYER 2 — FOUR FEATURE FAMILIES
@@ -444,8 +495,9 @@ def compute_family_b(stmt_df: pd.DataFrame, window: int = TFIDF_WINDOW) -> pd.Da
         sim_prev          = cosine_similarity(vec_i, mat[i - 1])[0, 0]
         novelty_prev[i]   = 1.0 - float(sim_prev)
         # Distance to trailing-window centroid
+        # np.asarray() converts sparse matrix mean (np.matrix) to ndarray
         start             = max(0, i - window)
-        centroid          = mat[start:i].mean(axis=0)
+        centroid          = np.asarray(mat[start:i].mean(axis=0))
         sim_win           = cosine_similarity(vec_i, centroid)[0, 0]
         novelty_window[i] = 1.0 - float(sim_win)
 
@@ -1432,3 +1484,394 @@ print("""
 │    underpriced — rv > iv (bool)                             │
 └─────────────────────────────────────────────────────────────┘
 """)
+
+# %% [markdown]
+# ---
+# # LAYER 5 — VISUALISATIONS
+# Six figures covering the full feature-to-vol story:
+#   1. Feature timeline with chair bands
+#   2. Feature correlation heat-map
+#   3. Forward RV distributions by chair era
+#   4. Walk-forward classifier performance
+#   5. Bootstrap coefficient CIs
+#   6. Warsh meeting spotlight
+
+# %% ── Visualisation helpers ──────────────────────────────────────────────────
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import TwoSlopeNorm
+
+VIZ_OUT = Path("fomc_viz")
+VIZ_OUT.mkdir(exist_ok=True)
+
+_CHAIR_COLORS = {
+    "Bernanke": "#2166ac",
+    "Yellen":   "#4dac26",
+    "Powell":   "#d6604d",
+    "Warsh":    "#762a83",
+    "Unknown":  "#aaaaaa",
+}
+
+def _chair_bands(ax, df: pd.DataFrame, alpha: float = 0.08) -> None:
+    """Shade background by chair era."""
+    dates = df["meeting_date"].values
+    chairs = df["chair"].values
+    for i, (d, c) in enumerate(zip(dates, chairs)):
+        x1 = dates[i + 1] if i + 1 < len(dates) else d + np.timedelta64(46, "D")
+        ax.axvspan(pd.Timestamp(d), pd.Timestamp(x1),
+                   color=_CHAIR_COLORS.get(c, "#aaaaaa"), alpha=alpha, linewidth=0)
+
+def _warsh_vlines(ax, df: pd.DataFrame) -> None:
+    """Draw vertical dashed lines for Warsh meetings."""
+    warsh = df[df["chair"] == "Warsh"]["meeting_date"]
+    for d in warsh:
+        ax.axvline(pd.Timestamp(d), color="#762a83", lw=1.2,
+                   ls="--", zorder=5, label="Warsh")
+
+def savefig(fig: plt.Figure, name: str) -> None:
+    path = VIZ_OUT / f"{name}.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"  Saved → {path}")
+
+
+# %% ── Fig 1: Feature timeline ────────────────────────────────────────────────
+
+def plot_feature_timeline(df: pd.DataFrame) -> plt.Figure:
+    """
+    Four-panel time series of the key vol-signal features, with chair era
+    shading and vertical markers for Warsh meetings.
+    """
+    features = [
+        ("word_count_zscore",    "Brevity z-score\n(word count vs trailing mean)", True),
+        ("novelty_prev",         "Novelty\n(cosine dist to prior statement)",       False),
+        ("guidance_density",     "Guidance density\n(hits / 100 words)",            False),
+        ("uncertainty_density",  "Uncertainty density\n(LM word fraction)",         False),
+    ]
+
+    fig, axes = plt.subplots(len(features), 1, figsize=(14, 10), sharex=True)
+    fig.suptitle(
+        "FOMC Statement Feature Timeline  |  Chair eras shaded  |  ── Warsh meetings",
+        fontsize=11, fontweight="bold"
+    )
+
+    sub = df.dropna(subset=["meeting_date"]).sort_values("meeting_date")
+
+    for ax, (col, ylabel, inverted) in zip(axes, features):
+        if col not in sub.columns:
+            ax.set_visible(False)
+            continue
+        _chair_bands(ax, sub)
+        vals = sub[col]
+        ax.plot(sub["meeting_date"], vals, color="#333333", lw=1.1, zorder=3)
+        ax.fill_between(sub["meeting_date"], vals, 0,
+                        where=(vals < 0) if inverted else (vals > vals.median()),
+                        alpha=0.18, color="#d62728", zorder=2)
+        ax.axhline(vals.median(), color="#888888", lw=0.7, ls=":")
+        _warsh_vlines(ax, sub)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.grid(axis="y", lw=0.4, alpha=0.5)
+
+    axes[-1].set_xlabel("Meeting date")
+
+    # Chair legend
+    patches = [mpatches.Patch(color=c, alpha=0.5, label=ch)
+               for ch, c in _CHAIR_COLORS.items() if ch != "Unknown"]
+    axes[0].legend(handles=patches, title="Chair", fontsize=7,
+                   title_fontsize=7, loc="upper right", ncol=2)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    savefig(fig, "fig1_feature_timeline")
+    return fig
+
+
+fig1 = plot_feature_timeline(master)
+plt.close("all")
+
+# %% ── Fig 2: Feature correlation heat-map ────────────────────────────────────
+
+def plot_feature_heatmap(df: pd.DataFrame) -> plt.Figure:
+    """
+    Pearson correlation matrix of all text features + forward RV.
+    Diverging palette so zero = white, positive = red, negative = blue.
+    """
+    rv_cols   = [c for c in df.columns if c.startswith("rv_yield")]
+    all_feats = VOL_FEATURES + ["polarity_hd"] + rv_cols
+    sub       = df[[c for c in all_feats if c in df.columns]].dropna(how="all")
+
+    corr = sub.corr()
+    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(corr.values, cmap="RdBu_r", norm=norm, aspect="auto")
+    plt.colorbar(im, ax=ax, label="Pearson r")
+
+    labels = [c.replace("rv_yield_10y_", "RV_").replace("_density", "")
+                .replace("_zscore", "_z").replace("word_count", "wc") for c in corr.columns]
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels, fontsize=7)
+
+    for i in range(len(corr)):
+        for j in range(len(corr)):
+            val = corr.values[i, j]
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                    fontsize=6, color="white" if abs(val) > 0.5 else "black")
+
+    ax.set_title("Feature Correlation Matrix  (text features + forward RV proxies)",
+                 fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    savefig(fig, "fig2_feature_heatmap")
+    return fig
+
+
+fig2 = plot_feature_heatmap(master)
+plt.close("all")
+
+# %% ── Fig 3: RV distributions by chair era ───────────────────────────────────
+
+def plot_rv_by_chair(df: pd.DataFrame) -> plt.Figure:
+    """
+    Violin + strip plot of forward RV at each horizon by chair era.
+    Shows whether meeting-day vol regime differs across chairs.
+    """
+    rv_cols   = [c for c in df.columns if re.match(r"rv_yield_10y_\d+d", c)]
+    if not rv_cols:
+        print("  No RV columns found — skipping Fig 3.")
+        return plt.figure()
+
+    n       = len(rv_cols)
+    chairs  = [c for c in _CHAIR_COLORS if c != "Unknown" and c in df["chair"].values]
+    x_pos   = np.arange(len(chairs))
+
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), sharey=False)
+    if n == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, rv_cols):
+        k = col.split("_")[-1]
+        for j, chair in enumerate(chairs):
+            vals = df[df["chair"] == chair][col].dropna().values
+            if len(vals) < 3:
+                continue
+            parts = ax.violinplot(vals, positions=[j], widths=0.5,
+                                  showmedians=True, showextrema=False)
+            for pc in parts["bodies"]:
+                pc.set_facecolor(_CHAIR_COLORS[chair])
+                pc.set_alpha(0.4)
+            parts["cmedians"].set_color(_CHAIR_COLORS[chair])
+            ax.scatter(np.full(len(vals), j) + np.random.uniform(-0.1, 0.1, len(vals)),
+                       vals, color=_CHAIR_COLORS[chair], alpha=0.5, s=12, zorder=3)
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(chairs, rotation=20, ha="right", fontsize=8)
+        ax.set_title(f"Forward RV {k}\n(10Y yield change, ann. pp)", fontsize=9)
+        ax.set_ylabel("Realized vol (pp)" if ax == axes[0] else "")
+        ax.grid(axis="y", lw=0.4, alpha=0.5)
+
+    fig.suptitle("Forward Realized Vol Distribution by Chair Era",
+                 fontsize=11, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    savefig(fig, "fig3_rv_by_chair")
+    return fig
+
+
+fig3 = plot_rv_by_chair(master)
+plt.close("all")
+
+# %% ── Fig 4: Walk-forward classifier performance ─────────────────────────────
+
+def plot_classifier_perf(clf_df: pd.DataFrame, df: pd.DataFrame) -> plt.Figure:
+    """
+    Two-panel figure:
+      Left:  predicted probability over time, coloured by actual label.
+      Right: precision-recall lift bar by chair era.
+    """
+    if clf_df is None or clf_df.empty:
+        print("  No classifier results — skipping Fig 4.")
+        return plt.figure()
+
+    clf_df = clf_df.copy()
+    clf_df["meeting_date"] = pd.to_datetime(clf_df["meeting_date"])
+    clf_merged = clf_df.merge(df[["meeting_date", "chair"]], on="meeting_date", how="left")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Walk-Forward Classifier: Vol-Elevated (Top-Tercile Forward RV)",
+                 fontsize=11, fontweight="bold")
+
+    # Left panel — probability time series
+    for _, row in clf_merged.iterrows():
+        color = "#d62728" if row["actual"] == 1 else "#2166ac"
+        ax1.scatter(row["meeting_date"], row["pred_prob"],
+                    color=color, s=30, zorder=3, alpha=0.8)
+
+    ax1.axhline(0.5, color="black", lw=0.8, ls="--", label="Decision threshold")
+    thresh_line = mpatches.Patch(color="#d62728", alpha=0.6, label="Actual elevated")
+    norm_line   = mpatches.Patch(color="#2166ac", alpha=0.6, label="Actual normal")
+    ax1.legend(handles=[thresh_line, norm_line,
+                         mpatches.Patch(color="white", label="─── threshold=0.5")],
+               fontsize=7)
+    _chair_bands(ax1,
+                 df[df["meeting_date"].isin(clf_merged["meeting_date"])].sort_values("meeting_date"))
+    ax1.set_ylabel("Predicted probability (vol elevated)")
+    ax1.set_xlabel("Meeting date")
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.grid(axis="y", lw=0.4, alpha=0.5)
+
+    # Right panel — precision by chair era
+    base_rate = clf_merged["actual"].mean()
+    chair_perf = []
+    for chair in [c for c in _CHAIR_COLORS if c != "Unknown"]:
+        sub = clf_merged[clf_merged["chair"] == chair]
+        if sub.empty or sub["predicted"].sum() == 0:
+            continue
+        prec = sub[sub["predicted"] == 1]["actual"].mean()
+        chair_perf.append({"chair": chair, "precision": prec,
+                            "lift": prec / base_rate if base_rate > 0 else np.nan,
+                            "n": len(sub)})
+
+    if chair_perf:
+        cp_df = pd.DataFrame(chair_perf)
+        x     = np.arange(len(cp_df))
+        bars  = ax2.bar(x, cp_df["precision"],
+                        color=[_CHAIR_COLORS.get(c, "#aaa") for c in cp_df["chair"]],
+                        alpha=0.75, edgecolor="white")
+        ax2.axhline(base_rate, color="black", lw=1, ls="--",
+                    label=f"Base rate {base_rate:.0%}")
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(
+            [f"{r['chair']}\n(n={r['n']})" for _, r in cp_df.iterrows()],
+            fontsize=8
+        )
+        ax2.set_ylabel("Precision (positive predictive value)")
+        ax2.set_title("Precision by Chair Era")
+        ax2.legend(fontsize=8)
+        ax2.set_ylim(0, 1.05)
+        # Annotate lift
+        for bar, (_, r) in zip(bars, cp_df.iterrows()):
+            if not np.isnan(r["lift"]):
+                ax2.text(bar.get_x() + bar.get_width() / 2,
+                         bar.get_height() + 0.02,
+                         f"{r['lift']:.1f}×", ha="center", va="bottom", fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    savefig(fig, "fig4_classifier_perf")
+    return fig
+
+
+_clf_results = clf_results if "clf_results" in dir() else pd.DataFrame()
+fig4 = plot_classifier_perf(_clf_results, master)
+plt.close("all")
+
+# %% ── Fig 5: Bootstrap coefficient CIs ──────────────────────────────────────
+
+def plot_bootstrap_ci(boot_df: pd.DataFrame) -> plt.Figure:
+    """
+    Forest plot of bootstrapped OLS coefficients (90 % CI) for the vol-signal
+    features.  Features whose CI excludes zero are marked in red.
+    """
+    if boot_df is None or boot_df.empty:
+        print("  No bootstrap results — skipping Fig 5.")
+        return plt.figure()
+
+    ci_cols = [c for c in boot_df.columns if c.startswith("ci_")]
+    if len(ci_cols) < 2:
+        return plt.figure()
+    lo_col, hi_col = ci_cols[0], ci_cols[1]
+    ci_pct = ci_cols[0].split("_")[1]
+
+    fig, ax = plt.subplots(figsize=(9, 0.6 * len(boot_df) + 2))
+    y_pos = np.arange(len(boot_df))
+
+    for i, (_, row) in enumerate(boot_df.iterrows()):
+        color = "#d62728" if row["sig"] else "#555555"
+        ax.plot([row[lo_col], row[hi_col]], [i, i], color=color, lw=2.5)
+        ax.scatter(row["coef_mean"], i, color=color, s=50, zorder=4)
+
+    ax.axvline(0, color="black", lw=0.9, ls="--")
+    labels = [r["feature"].replace("_", " ") for _, r in boot_df.iterrows()]
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel("OLS coefficient  (bootstrapped)")
+    ax.set_title(f"Bootstrap {ci_pct}% CI — Vol-signal Features on Forward RV 5d\n"
+                 "Red = CI excludes zero", fontsize=10, fontweight="bold")
+    ax.grid(axis="x", lw=0.4, alpha=0.5)
+    fig.tight_layout()
+    savefig(fig, "fig5_bootstrap_ci")
+    return fig
+
+
+_boot_df = boot_df if "boot_df" in dir() else pd.DataFrame()
+fig5 = plot_bootstrap_ci(_boot_df)
+plt.close("all")
+
+# %% ── Fig 6: Warsh meeting spotlight ────────────────────────────────────────
+
+def plot_warsh_spotlight(df: pd.DataFrame, feature_cols: list[str]) -> plt.Figure:
+    """
+    Radar / percentile bar chart showing each Warsh meeting's feature vector
+    relative to the full-sample distribution.  Each bar spans 0-100 pctile;
+    a red fill above 80 or below 20 flags an extreme reading.
+    """
+    warsh = df[df["chair"] == "Warsh"].dropna(subset=feature_cols, how="all")
+    if warsh.empty:
+        print("  No Warsh meetings in master — skipping Fig 6.")
+        return plt.figure()
+
+    n_meetings = len(warsh)
+    n_feats    = len(feature_cols)
+
+    fig, axes = plt.subplots(1, n_meetings,
+                             figsize=(6 * n_meetings, 5 + n_feats * 0.3),
+                             squeeze=False)
+    fig.suptitle("Warsh Meeting Spotlight — Percentile Ranks vs Full Sample\n"
+                 "(Red = extreme reading; threshold bands at 20th / 80th pctile)",
+                 fontsize=10, fontweight="bold")
+
+    for ax, (_, row) in zip(axes[0], warsh.iterrows()):
+        pctiles = []
+        for feat in feature_cols:
+            val = row.get(feat, np.nan)
+            if pd.isna(val):
+                pctiles.append(np.nan)
+            else:
+                pctiles.append(
+                    sp_stats.percentileofscore(df[feat].dropna().values, val, kind="rank")
+                )
+
+        y      = np.arange(n_feats)
+        colors = ["#d62728" if (p <= 20 or p >= 80) else "#4393c3"
+                  for p in pctiles]
+        bars   = ax.barh(y, pctiles, color=colors, alpha=0.75, edgecolor="white")
+
+        ax.axvline(20, color="#888888", lw=0.8, ls=":")
+        ax.axvline(80, color="#888888", lw=0.8, ls=":")
+        ax.axvline(50, color="#333333", lw=0.6, ls="--", alpha=0.4)
+
+        ax.set_xlim(0, 100)
+        ax.set_yticks(y)
+        ax.set_yticklabels([f.replace("_", " ") for f in feature_cols], fontsize=8)
+        ax.set_xlabel("Historical percentile rank")
+        ax.set_title(f"{row['meeting_date'].date()}\n(Warsh)", fontsize=9)
+        ax.grid(axis="x", lw=0.4, alpha=0.4)
+
+        # Annotate percentile values
+        for bar, p in zip(bars, pctiles):
+            if not np.isnan(p):
+                ax.text(min(p + 1, 97), bar.get_y() + bar.get_height() / 2,
+                        f"{p:.0f}",
+                        va="center", ha="left", fontsize=7)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    savefig(fig, "fig6_warsh_spotlight")
+    return fig
+
+
+fig6 = plot_warsh_spotlight(master, VOL_FEATURES)
+plt.close("all")
+
+print(f"\n{'═'*62}")
+print(f"  All figures saved to: {VIZ_OUT.resolve()}")
+print(f"  fomc_features.parquet: {PARQUET_OUT.resolve()}")
+print("═" * 62)
