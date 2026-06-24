@@ -32,7 +32,6 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from scipy import stats as sp_stats
@@ -40,7 +39,23 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import ElasticNetCV, Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score
-import statsmodels.api as sm
+# In Jupyter: switch to inline backend so figures embed in cell output.
+# In plain-Python script: use Agg (headless).
+try:
+    from IPython import get_ipython as _get_ipy
+    _ipy = _get_ipy()
+    if _ipy is not None:
+        _ipy.run_line_magic("matplotlib", "inline")
+    else:
+        matplotlib.use("Agg")
+except Exception:
+    matplotlib.use("Agg")
+
+# display() embeds a figure as a cell output in Jupyter; no-op elsewhere
+try:
+    from IPython.display import display as _ipy_display
+except ImportError:
+    def _ipy_display(*args, **kwargs): pass  # type: ignore[misc]
 
 warnings.filterwarnings("ignore")
 
@@ -1606,8 +1621,9 @@ def plot_small_multiples(tfidf_scores: dict, chair_corpora: dict) -> plt.Figure:
                framealpha=0.9, bbox_to_anchor=(0.5, -0.02))
     fig.tight_layout()
     fig.savefig(VIZ_OUT / "fig_wc_a_small_multiples.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
     print(f"  Saved → {VIZ_OUT}/fig_wc_a_small_multiples.png")
+    _ipy_display(fig)
+    plt.close(fig)
     return fig
 
 
@@ -1634,8 +1650,9 @@ def plot_comparison_cloud(tfidf_scores: dict) -> plt.Figure:
     fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=10)
     fig.tight_layout()
     fig.savefig(VIZ_OUT / "fig_wc_b_powell_warsh.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
     print(f"  Saved → {VIZ_OUT}/fig_wc_b_powell_warsh.png")
+    _ipy_display(fig)
+    plt.close(fig)
     return fig
 
 
@@ -1700,8 +1717,9 @@ def plot_bucket_mix_bars(chair_corpora: dict, scored_lexicon: pd.DataFrame) -> p
     ax.grid(axis="x", lw=0.4, alpha=0.4)
     fig.tight_layout()
     fig.savefig(VIZ_OUT / "fig_wc_c_bucket_mix.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
     print(f"  Saved → {VIZ_OUT}/fig_wc_c_bucket_mix.png")
+    _ipy_display(fig)
+    plt.close(fig)
     return fig, mixes
 
 
