@@ -845,6 +845,7 @@ def compute_vrp_gap(realized: pd.DataFrame, implied: pd.DataFrame) -> pd.DataFra
 
 
 vrp_panel = compute_vrp_gap(realized_curve, implied_curve)
+vrp_panel.to_parquet(Path("vrp_cache") / "vrp_panel.parquet", index=False)
 
 # %% [markdown]
 # ---
