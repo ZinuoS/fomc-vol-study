@@ -1,100 +1,128 @@
 # %% [markdown]
-# # FOMC Delta-Hedged Straddle — P&L Simulation & Position Sizer
+# # FOMC Vol-Spread Steepener — P&L Simulation & Position Sizer
 #
-# **Trade thesis**: Long ATM straddle (post-FOMC expiry) entered post-CPI,
-# exited pre month-end.  Delta-hedging is divided into three phases that
-# isolate the FOMC convexity while windowing out auction and month-end noise.
+# **Trade thesis (updated v2)**: Long ATM straddle on ZT (2Y futures) +
+# Short ATM straddle on ZB (30Y futures).  The GapSpread model predicts
+# the 2Y event vol is underpriced relative to 30Y — buy front, sell long.
+#
+# At `z_spread = 0` (no edge) the simulation breaks even after costs.
+# At `z_spread > 0` (buy-front signal) the 2Y FOMC jump is amplified and
+# both the long-leg sizing and the simulated jump point in the same direction.
 #
 # ---
-# ## Catalyst calendar (July 2026 FOMC cycle)
+# ## Catalyst calendar (Warsh FOMC — June 2026)
 #
 # | Day | Event | Phase | Hedge action |
 # |-----|-------|-------|--------------|
-# | −10 bd | CPI print → **entry** | — | Buy straddle |
-# | −2 bd | **5Y note auction** | 2 | Flatten before, hold flat through, flatten after |
+# | −10 bd | CPI print → **entry** | — | Buy ZT straddle, sell ZB straddle |
+# | −2 bd | **5Y note auction** | 2 | Bracket both legs |
 # | −1 bd | **7Y note auction** | 2 | Same bracket |
-# | 0 (2pm) | **FOMC decision** | 3 | Stop hedging ~5 min before; keep convexity |
-# | +1 bd | **Exit** pre month-end/PCE | — | Unwind straddle + residual hedge |
+# | 0 (2pm) | **FOMC decision** | 3 | Drop hedges; keep convexity |
+# | +1 bd | **Exit** | — | Unwind both straddles + residual hedges |
 #
 # ---
 # ## Three-phase hedge logic
 #
-# **Phase 1 — Run-up** (entry → auction eve): daily delta-band hedge.
-# Rebalance whenever |Δ_net| > ε.  Captures realized gamma vs implied,
-# bleeds proportionally to (σ_implied − σ_realized)².
+# **Phase 1** (run-up): daily delta-band hedge on both legs.
 #
-# **Phase 2 — Auctions**: event-bracketed.
-# (a) Flatten Δ → 0 just before auction opens.
-# (b) Hold that flat through the directional reaction.
-# (c) Flatten back to straddle-Δ after the dust settles.
-# Auction directional P&L nets to zero; only gamma/convexity survives.
+# **Phase 2** (auctions): event-bracketed hedge — flatten Δ before,
+# hold through the directional reaction, flatten after.  Auction directional
+# P&L nets to zero; only gamma/convexity survives.
 #
-# **Phase 3 — Event → exit**: no hedging from ~5 min before 2 pm.
-# Full convexity preserved through the FOMC jump; unwind next morning.
+# **Phase 3** (event → exit): no hedging.  Full convexity preserved through
+# the FOMC jump; short 30Y leg has a stop-loss cap at `stop_loss_30y × premium`.
 
-# %% ── Imports & config ────────────────────────────────────────────────────────
+# %% ── Imports & signal ────────────────────────────────────────────────────────
 
 from pathlib import Path
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import copy
 
 from fomc_delta_hedge_sim import (
     StraddleConfig, run_mc, size_position,
     print_report, band_sensitivity, plot_results,
-    b76_straddle, b76_delta, b76_gamma,
-    load_signal_mult, ANNUAL,
+    b76_straddle,
+    load_spread_signal, acceptance_tests, ANNUAL,
+    sigma_fomc_leg,
 )
 
-# Load NLP signal from VRP pipeline output
-SIGNAL_MULT = load_signal_mult(Path("gap_forecasts.parquet"))
+# Load the GapSpread signal from the spread model output
+sig = load_spread_signal(Path("gap_forecasts_spread.parquet"))
 
-# ── July 2026 FOMC trade configuration ────────────────────────────────────────
+print(f"\n── Warsh FOMC Signal (gap_forecasts_spread.parquet) ─────────────────")
+print(f"  z_spread        = {sig['z_spread']:+.3f}  (GapSpread / sigma_f)")
+print(f"  steepener_signal= {sig['steepener_signal']}")
+print(f"  signal_mult_2y  = {sig['signal_mult_2y']:.3f}×")
+print(f"  signal_mult_30y = {sig['signal_mult_30y']:.3f}×")
+
+# %% ── Trade configuration ─────────────────────────────────────────────────────
 #
-# ZN Sep26 futures ≈ 108.50.  ATM straddle spanning July FOMC.
-# Entry IV: VXTYN-equivalent proxy ~8.2% (consistent with pipeline mean).
-# Exit IV:  post-FOMC vol typically compresses 2–2.5 vol points.
-# Sigma regimes estimated from historical GK vol (see fomc_vrp_pipeline.py):
-#   σ_quiet  = 6.0%   (Phase 1, non-event days)
-#   σ_auction = 11.0%  (5Y/7Y auction days, elevated supply uncertainty)
-#   σ_FOMC   = 20.0%  (FOMC event vol; consistent with VRP pipeline mean RV)
+# ZT Sep26 (2Y) ≈ 108.50, ZB Sep26 (30Y) ≈ 118.00.
+# Event vols extracted from FOMC-expiry option vol kink:
+#   sigma_iv_event     = 20.0%  (2Y: front is cheap = BUY)
+#   sigma_iv_event_30y = 16.0%  (30Y: long end less reactive per Warsh RV data)
+# sigma_quiet is AUTO-CALIBRATED so E[P&L | z=0] = −costs.
 
 cfg = StraddleConfig(
-    F0=108.50,
-    K=108.50,
-    iv_entry=0.082,
-    iv_exit=0.062,
-    days_entry=-10,
-    days_5y_auction=-2,
-    days_7y_auction=-1,
-    days_fomc=0,
-    days_exit=1,
-    T_entry=14.0 / ANNUAL,
-    sigma_quiet=0.060,
+    # ── 2Y front leg (LONG)
+    F0=108.50,          K=108.50,
+    iv_entry=0.082,     iv_exit=0.062,
+    sigma_iv_event=0.200,
+    # ── Calendar
+    days_entry=-10,     days_5y_auction=-2,
+    days_7y_auction=-1, days_fomc=0,
+    days_exit=1,        T_entry=14.0 / ANNUAL,
+    # ── Vol params (sigma_quiet auto-calibrated)
     sigma_auction=0.110,
-    sigma_fomc=0.200,
+    auto_calibrate=True,
     band_phase1=0.10,
     half_spread=1.0 / 64.0,
-    tick_value=1_000.0,
-    n_lots=1,
-    n_paths=5_000,
+    tick_value=1_000.0,         # ZN/ZT tick value
+    n_lots=1, n_paths=5_000, seed=42,
+    # ── Risk limits
     portfolio_nav=1_000_000.0,
     max_loss_budget=50_000.0,
     kelly_fraction=0.25,
-    signal_mult=SIGNAL_MULT,
+    # ── TWO-LEG STEEPENER
+    is_steepener=True,
+    F0_30y=118.00,      K_30y=118.00,
+    iv_entry_30y=0.085, iv_exit_30y=0.075,
+    sigma_iv_event_30y=0.160,
+    sigma_auction_30y=0.090,
+    tick_value_30y=1_000.0,
+    stop_loss_30y=3.0,           # cap short-leg loss at 3× premium received
+    rho_curve=0.60,
+    # ── GapSpread signal (FIX 1 coherence)
+    z_spread        = sig["z_spread"],
+    signal_mult_2y  = sig["signal_mult_2y"],
+    signal_mult_30y = sig["signal_mult_30y"],
 )
 
-print(f"Signal mult loaded from VRP pipeline: {SIGNAL_MULT:.3f}×")
-print(f"Entry straddle premium: "
-      f"{b76_straddle(cfg.F0, cfg.K, cfg.T_entry, cfg.iv_entry):.4f} pts  "
-      f"= ${b76_straddle(cfg.F0, cfg.K, cfg.T_entry, cfg.iv_entry)*cfg.tick_value:,.0f} per lot")
-print(f"Entry gamma: "
-      f"{b76_gamma(cfg.F0, cfg.K, cfg.T_entry, cfg.iv_entry):.4f} per pt  "
-      f"(breakeven band ≈ ±{1/b76_gamma(cfg.F0, cfg.K, cfg.T_entry, cfg.iv_entry)**0.5:.2f} pts for 1-Δ move)")
+# ── Display calibrated vols
+print(f"\n── Calibrated parameters (FIX 2: auto-calibrate=True) ──────────────")
+print(f"  sigma_quiet (2Y):  {cfg.sigma_quiet*100:.2f}%  "
+      f"(was 6.00%; calibrated from iv_entry={cfg.iv_entry*100:.1f}%, "
+      f"sigma_iv_event={cfg.sigma_iv_event*100:.0f}%)")
+print(f"  sigma_quiet (30Y): {cfg.sigma_quiet_30y*100:.2f}%  "
+      f"(calibrated from iv_entry_30y={cfg.iv_entry_30y*100:.1f}%)")
+sig_f_2y  = sigma_fomc_leg(cfg.sigma_iv_event,     cfg.z_spread, cfg.kappa, True)
+sig_f_30y = sigma_fomc_leg(cfg.sigma_iv_event_30y, cfg.z_spread, cfg.kappa, False)
+print(f"  sigma_fomc_2y:     {sig_f_2y*100:.1f}%  "
+      f"(= iv_event × (1 + {cfg.kappa}×{cfg.z_spread:.2f}))")
+print(f"  sigma_fomc_30y:    {sig_f_30y*100:.1f}%  "
+      f"(= iv_event_30y × max(0.01, 1 − {cfg.kappa}×{cfg.z_spread:.2f}))")
+
+V0_2y  = b76_straddle(cfg.F0, cfg.K, cfg.T_entry, cfg.iv_entry)
+V0_30y = b76_straddle(cfg.F0_30y, cfg.K_30y, cfg.T_entry, cfg.iv_entry_30y)
+print(f"\n  2Y  premium: {V0_2y:.4f} pts = ${V0_2y*cfg.tick_value:,.0f}/lot")
+print(f"  30Y premium: {V0_30y:.4f} pts = ${V0_30y*cfg.tick_value_30y:,.0f}/lot")
+print(f"  Net premium paid (long − received): "
+      f"${(V0_2y*cfg.tick_value - V0_30y*cfg.tick_value_30y):+,.0f}/lot-pair")
 
 # %% ── Monte Carlo simulation ──────────────────────────────────────────────────
 
-print("Running 5,000 MC paths ...")
+print("\nRunning 5,000 MC paths (two-leg steepener) ...")
 df_sim = run_mc(cfg)
 sizing = size_position(df_sim, cfg)
 print_report(df_sim, cfg, sizing)
@@ -102,162 +130,155 @@ print_report(df_sim, cfg, sizing)
 # %% [markdown]
 # ## Reading the P&L output
 #
-# | Metric | Value | Interpretation |
-# |--------|-------|----------------|
-# | **Sharpe** | 0.077 | Low per-trade; this is a convexity bet, not an edge grind |
-# | **Win rate** | 40.6% | >50% of paths lose — theta bleed dominates small FOMC moves |
-# | **Mean P&L** | +$54 | Positive EV driven entirely by large-jump tail |
-# | **VaR99** | −$888/lot | Tail loss if FOMC jump is small AND Phase 1 bleeds fully |
-# | **Kelly lots** | 110 | Upper bound from return-on-premium Kelly formula |
-# | **VaR lots** | 56 | Budget-binding constraint (50k/888 per lot) |
-# | **Final lots** | 36 | VaR × inverse signal_mult (1/1.582) — see below |
+# ### Two-leg net payoff
 #
-# ### Why win rate < 50% is OK
+# The long 2Y straddle has a convex, right-skewed payoff: limited loss (premium),
+# unlimited gain on large FOMC moves.
 #
-# A long delta-hedged straddle has a **convex, positively-skewed** payoff:
-# - Most paths: small FOMC jump → straddle barely compensates theta bleed → small loss
-# - Tail paths: large FOMC jump → straddle explodes in value → large gain
+# The short 30Y straddle has a CONCAVE payoff: receive premium upfront,
+# unlimited loss if 30Y rates move sharply.  The stop-loss caps this at
+# `stop_loss_30y × premium_received`.
 #
-# The mean is positive (+$54) despite 59% loss rate because the gains on large-jump
-# paths dominate.  This is the correct payoff profile for an event-convexity trade.
+# ### Why the trade works at positive z_spread
 #
-# ### Phase 1 bleed is intentional
+# At `z_spread > 0` (GapSpread says 2Y RV > 2Y IV):
+# - The 2Y leg jumps MORE than the IV implies → straddle value explodes → **profit**
+# - The 30Y leg jumps LESS than the IV implies → short straddle keeps the premium → **profit**
+# - Both legs benefit: the model's edge manifests in both the jump size and the sizing
 #
-# σ_quiet (6%) < σ_iv (8.2%) → Phase 1 theta bleed is **larger** than realized gamma.
-# This is by design: you are paying a running premium to hold the FOMC convexity.
-# The Phase 1 hedge bleeds ~$110/lot over 8 quiet days; the FOMC jump needs to
-# overcome that bleed plus the entry premium.  Break-even FOMC move ≈ 1.4 pts
-# (≈ 1.0σ of σ_fomc = 20%/√252).
+# ### Warsh specifics (z = +2.67)
+#
+# | Parameter | Value |
+# |-----------|-------|
+# | sigma_fomc_2y (realized) | ~46.7% (vs 20% IV → front is underpriced) |
+# | sigma_fomc_30y (realized) | ~1–2% (vs 16% IV → 30Y doesn't move) |
+# | signal_mult_2y | 2.335× (upsize long leg) |
+# | signal_mult_30y | 2.335× (upsize short leg — 30Y quiescent) |
+
+# %% ── Acceptance tests (FIX 1 + 2 + 3) ──────────────────────────────────────
+
+print("\nRunning acceptance tests ...")
+results = acceptance_tests(cfg, n_paths=8_000, seed=99)
+
+# %% [markdown]
+# ## Acceptance test summary
+#
+# | Test | What it checks | Pass criterion |
+# |------|---------------|----------------|
+# | **T1 Break-even** | E[P&L \| z=0] ≈ −costs | ratio ≤ 5% |
+# | **T2 Coherence** | sigma_fomc_2y > iv_event AND signal_mult > 1 at z>0 | both True |
+# | **T3 Monotone** | Mean P&L rises monotonically with z | all Δ ≥ 0 |
+# | **T4 Two-leg** | Short 30Y stop-loss cap works; worst < 50% stop rate | both True |
+#
+# If T1 fails, the calibration is off — only DIFFERENCES across z are meaningful.
+# T2 is the coherence invariant: the simulator can no longer be bullish on jumps
+# but bearish on sizing (the old contradiction).
 
 # %% ── Band sensitivity ────────────────────────────────────────────────────────
 
-print("Phase-1 hedge band sensitivity (2,000 paths each)...")
+print("\nPhase-1 hedge band sensitivity (2,000 paths each)...")
 sens = band_sensitivity(cfg)
 print(sens.to_string(index=False,
       float_format=lambda x: f"{x:,.2f}" if abs(x) >= 1 else f"{x:.4f}"))
 
 # %% [markdown]
-# ## Band sensitivity interpretation
+# ## Band sensitivity
 #
-# | Band (Δ) | Sharpe | Cost | Rebalances | Observation |
-# |----------|--------|------|-----------|-------------|
-# | 0.05 | 0.084 | −$34 | 10.1 | Over-hedges; cost erodes small gamma edge |
-# | **0.10** | **0.085** | **−$33** | **8.5** | **Near-optimal; default choice** |
-# | 0.20 | 0.088 | −$30 | 6.4 | Slightly wider band, better cost, marginal improvement |
-# | 0.30 | 0.094 | −$28 | 5.4 | Best Sharpe but higher delta variance overnight |
-# | 0.50 | 0.090 | −$26 | 4.6 | Too wide — Sharpe drops, delta variance dominates |
+# As in the single-leg case, Sharpe is remarkably flat across Phase-1 bands.
+# The FOMC jump (Phase 3, no hedge) dominates the joint P&L distribution.
+# Default band 0.10–0.20 Δ is adequate for both legs.
 #
-# **Key insight**: Sharpe is remarkably flat across bands (0.084–0.094).
-# The FOMC jump (Phase 3, no hedge) completely dominates the P&L distribution;
-# Phase 1 hedge drag is a second-order effect.  This validates the three-phase
-# design: **don't optimise the band too aggressively — the FOMC event is what
-# determines whether the trade works, not the intraday hedge frequency**.
-#
-# Practical recommendation: **band = 0.10–0.20 Δ** balances cost and delta control.
-# Tighter than 0.10 adds cost without meaningful Sharpe improvement.
-# Looser than 0.30 risks accumulating unintended delta into the FOMC.
+# The short 30Y leg's Phase-1 band controls how much delta drift accumulates
+# before the FOMC — a wider band means slightly more directional risk in the
+# short leg entering Phase 3, but minimal Sharpe impact.
 
 # %% ── Figures ─────────────────────────────────────────────────────────────────
 
 fig = plot_results(df_sim, cfg, sens)
+plt.savefig("fomc_viz/fig_delta_hedge_sim.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 # %% [markdown]
 # ## Figure commentary
 #
-# **Top-left — P&L distribution**: Right-skewed, fat right tail.
-# The cluster of losses near −$888 is paths where the FOMC move was < 1σ and
-# Phase 1 bleed was near-maximum.  The long right tail (gains > $2k/lot) captures
-# 2σ+ FOMC moves where the straddle explodes.  This is the convexity profile
-# you want: limited left tail (max loss ≈ straddle premium), unlimited right tail.
+# **Top-left — Net P&L distribution**: Two-humped shape reflects the two competing
+# legs.  Left cluster = small FOMC moves (neither leg pays off well; long 2Y
+# bleeds theta, short 30Y retains premium but barely).  Right tail = large 2Y
+# moves where the long straddle explodes.
 #
-# **Top-right — P&L components**: Straddle +$65, hedge +$22, cost −$33.
-# The hedge P&L is *positive* because the delta bracketing in Phase 2 captures
-# auction vol spikes (σ_auction = 11% > σ_iv = 8.2%), more than offsetting
-# Phase 1 bleed.  The net hedge contribution is +$22 — the auction bracketing
-# adds value, not just noise control.
+# **Top-middle — P&L components**: The short 30Y hedge P&L appears as a positive
+# contribution when 30Y is quiet (premium retained) and negative when 30Y moves.
 #
-# **Bottom-left — P&L vs FOMC jump**: Near-perfect convexity curve.
-# P&L is close to zero for |jump| < 0.5 pts and accelerates quadratically for
-# large jumps, consistent with Γ × ΔF² / 2.  The scatter is from Phase 1-2
-# variation (different quiet vol realisations).  The Phase 3 "no-hedge" design
-# preserves this clean convexity — any hedging in Phase 3 would flatten the curve.
+# **Top-right — Per-leg P&L**: Long 2Y (green) has classic long-straddle shape;
+# short 30Y (red) is the mirror — premium collected but tail losses are visible
+# until the stop fires.  The stop-loss truncates the red tail.
 #
-# **Bottom-right — rebalances**: Mean 8.5, mostly 7–10 over 10 days.
-# Phase 2 adds exactly 4 mandatory rebalances (2 auctions × 2 brackets each).
-# Phase 1 contributes 4–6 band-triggered rebalances over 8 quiet days.
-# Total transaction cost ≈ −$33/lot at 0.5-tick spread — a 2% drag on premium.
+# **Bottom-left — Convexity scatter**: Joint net P&L vs 2Y FOMC move.
+# Quadratic curvature from the long leg; short leg dampens the flat section.
+# At z=+2.67 the long leg dominates for large moves.
+#
+# **Bottom-middle — Rebalances**: ~8–12 per path across both legs.
+#
+# **Bottom-right — Joint jump distribution**: 2Y vs 30Y FOMC moves, colored by
+# net P&L.  High rho_curve=0.60 is visible.  Top-right paths (both legs move up)
+# have mixed P&L; the best paths are those where 2Y moves a lot but 30Y doesn't.
 
-# %% ── NLP signal integration ──────────────────────────────────────────────────
+# %% ── z-sweep: edge as a function of signal ──────────────────────────────────
 
-print("\n── NLP Signal Integration ──────────────────────────────────────────────")
-print(f"  VRP model signal_mult   = {SIGNAL_MULT:.3f}  (from gap_forecasts.parquet)")
-print(f"  Inverse mult for LONG   = {1/SIGNAL_MULT:.3f}  (sell-vol signal → reduce long)")
-print(f"  VaR base lots           = {sizing['var_lots']:.1f}")
-print(f"  Final lots (VaR × inv)  = {sizing['final_lots']}")
-print()
-print("  The VRP pipeline predicts gap_yc_bps2 > 0 (IV > RV) for the Warsh FOMC.")
-print("  For a LONG straddle this is a headwind in Phase 1–2: we are paying implied")
-print("  vol that is expected to exceed realised vol.  The signal_mult = 1.58 means")
-print("  the sell-vol edge is strong → reduce the long straddle by 1/1.58 = 63%.")
-print()
-print("  Phase 3 (FOMC convexity) is orthogonal to the VRP signal: the realised")
-print("  FOMC jump is a separate event risk not captured by the gap model, which")
-print("  predicts the *average* IV−RV spread, not whether this specific meeting")
-print("  will have an unusually large or small move.")
-print()
-print(f"  Sizing summary:")
-print(f"    Base (VaR-constrained): {sizing['var_lots']:.0f} lots × "
-      f"${sizing['premium_per_lot']:,.0f} = "
-      f"${sizing['var_lots']*sizing['premium_per_lot']:,.0f} premium")
-print(f"    NLP-adjusted (÷ 1.58):  {sizing['final_lots']} lots × "
-      f"${sizing['premium_per_lot']:,.0f} = "
-      f"${sizing['final_lots']*sizing['premium_per_lot']:,.0f} premium")
-print(f"    Expected P&L at scale:  "
-      f"${sizing['final_lots'] * sizing['mu_per_lot']:+,.0f}  "
-      f"(std: ${sizing['final_lots'] * sizing['sigma_per_lot']:,.0f})")
+print("\n── z-sweep: E[P&L] vs GapSpread z-score ──────────────────────────────")
+z_sweep_vals = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 2.67, 3.0]
+sweep_rows = []
+for z in z_sweep_vals:
+    c_z = copy.deepcopy(cfg)
+    c_z.z_spread = z
+    c_z.auto_calibrate = True
+    c_z.__post_init__()
+    df_z = run_mc(c_z)
+    tv   = c_z.tick_value
+    sweep_rows.append({
+        "z_spread":     z,
+        "mean_pnl":     df_z["total_pnl"].mean() * tv,
+        "win_rate_%":   (df_z["total_pnl"] > 0).mean() * 100,
+        "mean_pnl_2y":  df_z["total_pnl_2y"].mean() * tv,
+        "mean_pnl_30y": df_z["total_pnl_30y"].mean() * tv,
+        "stop_rate_%":  df_z["stop_fired"].mean() * 100,
+    })
+
+df_sweep = pd.DataFrame(sweep_rows)
+print(df_sweep.to_string(index=False, float_format=lambda x: f"{x:+.1f}" if abs(x) > 1 else f"{x:.3f}"))
 
 # %% [markdown]
-# ## Position sizing summary
+# ## z-sweep interpretation
 #
-# ### Three-level size stack
+# The sweep shows the P&L monotonically rising with `z_spread` — this is Test 3
+# in the acceptance suite.  At `z=0` the mean P&L ≈ −costs (break-even).
+# At `z=+2.67` (Warsh) the mean is strongly positive, driven by the amplified
+# 2Y jump.  Negative z (buy-long, sell-front) loses money on average as the
+# short 2Y leg pays out and the long 30Y leg underperforms.
 #
-# 1. **VaR-constrained base (56 lots)**
-#    Budget: max 99th-pctile loss ≤ $50k.
-#    At −$888/lot VaR99: `50,000 / 888 = 56.3 lots`.
-#    This is the hard risk limit — never exceed.
-#
-# 2. **Kelly upper bound (110 lots)**
-#    `f* = μ_ret / σ_ret² = 18.5%` of NAV in premium.
-#    `18.5% × $1M / $1,673 per lot = 110 lots`.
-#    Kelly is not binding here — VaR binds first.
-#
-# 3. **NLP signal adjustment (÷ signal_mult = ÷ 1.58 → 36 lots)**
-#    The VRP model's strong sell-vol signal (signal_mult = 1.58) says Phase 1–2
-#    is fighting the vol risk premium.  Reduce by 1/1.58 = 63% → **36 lots**.
-#    Premium deployed: ~$60k.
-#
-# ### When to override the NLP adjustment
-#
-# - If the NLP model's gap_hat is driven by **uncertainty/ambiguity** on the
-#   long end (30Y), but the specific meeting is clearly a short-rate event
-#   (2Y moving 180 bps as in the Warsh case), the model's tenor selection is
-#   stale (2010–2020 training).  In that case, use VaR base (56 lots) without
-#   the NLP discount.
-#
-# - If the auction supply calendar is unusually heavy (e.g., off-cycle 20Y
-#   alongside the standard 5Y/7Y), widen Phase 2 bracket windows and reduce
-#   base size by 10–15% to account for higher bracket slippage.
-#
-# ### Connecting to fomc_straddle_mc.py
-#
-# The `final_lots` feeds directly into `MCConfig`:
-# ```python
-# mc_cfg = MCConfig(
-#     n_straddles = sizing["final_lots"],      # 36 for July 2026
-#     signal_mult = 1.0,                       # already absorbed into lot count
-#     hedge_band  = cfg.band_phase1,           # 0.10 Δ
-# )
-# ```
-# The MC simulation in `fomc_straddle_mc.py` then generates the full
-# path-dependent payoff with realistic slippage and vol surface dynamics.
+# The short-leg stop rate rises with |z|, reflecting that extreme forecasts imply
+# larger moves on all tenors.  The stop-loss at 3× premium keeps the tail bounded.
+
+# %% ── Position sizing summary ─────────────────────────────────────────────────
+
+print("\n── Final Position Sizing ─────────────────────────────────────────────")
+print(f"  Portfolio NAV:         ${cfg.portfolio_nav:>12,.0f}")
+print(f"  Max loss budget (VaR): ${cfg.max_loss_budget:>12,.0f}")
+print(f"  VaR99 ($/lot):         ${sizing['q01_per_lot']:>+12,.0f}")
+print(f"  VaR-constrained lots:  {sizing['var_lots']:>12.1f}")
+print(f"  Kelly lots:            {sizing['kelly_lots']:>12.1f}")
+print(f"  signal_mult_2y:        {sizing['signal_mult']:>12.3f}×")
+print(f"  FINAL 2Y lots:         {sizing['lots_2y']:>12d}")
+print(f"  FINAL 30Y lots:        {sizing['lots_30y']:>12d}")
+premium_2y  = V0_2y  * sizing["lots_2y"]  * cfg.tick_value
+premium_30y = V0_30y * sizing["lots_30y"] * cfg.tick_value_30y
+print(f"\n  2Y  premium deployed:  ${premium_2y:>12,.0f}  ({sizing['lots_2y']} × ${V0_2y*cfg.tick_value:,.0f})")
+print(f"  30Y premium received:  ${premium_30y:>12,.0f}  ({sizing['lots_30y']} × ${V0_30y*cfg.tick_value_30y:,.0f})")
+print(f"  Net premium at risk:   ${premium_2y - premium_30y:>+12,.0f}")
+exp_net = sizing["lots_2y"] * df_sim["total_pnl_2y"].mean() * cfg.tick_value + \
+          sizing["lots_30y"] * df_sim["total_pnl_30y"].mean() * cfg.tick_value
+print(f"\n  Expected net P&L at scale: ${exp_net:>+,.0f}")
+print(f"  Short 30Y tail (worst case per lot @ stop):  "
+      f"${df_sim['total_pnl_30y'].min()*cfg.tick_value:+,.0f}")
+print(f"  Short 30Y tail at scale ({sizing['lots_30y']} lots):  "
+      f"${df_sim['total_pnl_30y'].min()*cfg.tick_value*sizing['lots_30y']:+,.0f}")
