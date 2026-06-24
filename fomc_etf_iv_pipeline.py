@@ -94,6 +94,7 @@ def load_fomc_dates(features_parquet: Path = REPO_DIR / "fomc_features.parquet")
 
 _FRED_REST_BASE  = "https://api.stlouisfed.org/fred/series/observations"
 _FRED_CSV_URL    = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
+_VXTYN_END       = pd.Timestamp("2020-05-15")   # CBOE TYVIX discontinued
 
 FRED_SERIES = {
     # Treasury yields
@@ -187,7 +188,6 @@ def build_fred_panel(start: str = "2004-01-01") -> pd.DataFrame:
     panel = panel.sort_index()
 
     # ffill yields/curve features but NOT VXTYN past its discontinuation date
-    _VXTYN_END = pd.Timestamp("2020-05-15")
     vxtyn_col  = parts.get("vxtyn")
     panel = panel.ffill()
     if "vxtyn" in panel.columns and vxtyn_col is not None:
@@ -592,21 +592,239 @@ def load_manual_iv() -> pd.DataFrame:
     return df
 
 
-# ── 3d. Main implied vol builder ──────────────────────────────────────────────
+# ── 3d. VXTYN bridge (pre-2020 IV seeding from vrp_panel.parquet) ────────────
+
+# ETF modified durations (years) — approximate, used for yield→price vol conversion.
+# SHY 1-3Y: 1.9Y, IEI 3-7Y: 4.5Y, IEF 7-10Y: 7.5Y, TLH 10-20Y: 11Y, TLT 20Y+: 16Y
+_ETF_DURATION: dict[str, float] = {
+    "SHY": 1.9, "IEI": 4.5, "IEF": 7.5, "TLH": 11.0, "TLT": 16.0,
+}
+
+# Maps existing vrp_panel tenor → ETF ticker.
+# Duration basis: IEF duration ≈ 7Y (not 10Y); TLT ≈ 17Y (not 30Y).
+# This introduces a level bias; use as bridge / cross-check, not primary IV source.
+_VXTYN_TENOR_TO_ETF: dict[str, str] = {
+    "2Y":  "SHY",
+    "5Y":  "IEI",
+    "10Y": "IEF",
+    "20Y": "TLH",
+    "30Y": "TLT",
+}
+_VRP_PANEL = REPO_DIR / "vrp_cache" / "vrp_panel.parquet"
+
+
+def seed_iv_from_vxtyn_bridge(
+    vrp_panel_path: Path = _VRP_PANEL,
+    etf_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """
+    Load VXTYN-derived IV from vrp_panel.parquet and remap tenor → ETF ticker.
+
+    Units: iv_event_vol (%) is in lognormal price-vol space — same convention
+    as AlphaVantage IV and GK RV.  iv_event_var = (iv_event_vol/100)^2.
+
+    Coverage: 2010-01-27 → 2020-04-29 (VXTYN discontinued 2020-05-15).
+    Source tag: 'vxtyn_bridge' — has futures/ETF duration basis; acceptable for
+    pre-2020 cross-check and model training, not for post-2020 gap filling.
+
+    Basis caveats:
+      SHY duration ≈ 1.9Y  (maps to 2Y tenor  — close)
+      IEI duration ≈ 4.5Y  (maps to 5Y tenor  — moderate basis)
+      IEF duration ≈ 7.5Y  (maps to 10Y tenor — vol will be overstated)
+      TLH duration ≈ 11Y   (maps to 20Y tenor — large basis)
+      TLT duration ≈ 16Y   (maps to 30Y tenor — large basis)
+    """
+    etf_map = etf_map or ETF_MAP
+    if not vrp_panel_path.exists():
+        print(f"  [VXTYN bridge] {vrp_panel_path} not found — skipping")
+        return pd.DataFrame()
+
+    vp = pd.read_parquet(vrp_panel_path)
+    vp["meeting_date"] = pd.to_datetime(vp["meeting_date"])
+
+    rows = []
+    for tenor, etf in _VXTYN_TENOR_TO_ETF.items():
+        if etf not in etf_map:
+            continue
+        sub = vp[(vp["tenor"] == tenor) & vp["iv_event_vol"].notna()].copy()
+        if sub.empty:
+            continue
+        sub = sub.rename(columns={"iv_event_vol": "iv_event_vol_pct"})
+        sub["etf"]              = etf
+        sub["tenor_proxy"]      = etf_map[etf]
+        sub["iv_event_var"]     = (sub["iv_event_vol_pct"] / 100) ** 2
+        sub["source"]           = "vxtyn_bridge"
+        sub["window_flag"]      = "vxtyn_30d_kink"
+        sub["expiry_pre"]       = pd.NaT
+        sub["expiry_post"]      = pd.NaT
+        sub["T_pre_years"]      = np.nan
+        sub["T_post_years"]     = np.nan
+        sub["iv_pre_pct"]       = np.nan
+        sub["iv_post_pct"]      = np.nan
+        rows.append(sub[["meeting_date","etf","tenor_proxy","iv_event_var",
+                          "iv_event_vol_pct","source","window_flag",
+                          "expiry_pre","expiry_post","T_pre_years","T_post_years",
+                          "iv_pre_pct","iv_post_pct"]])
+
+    if not rows:
+        return pd.DataFrame()
+
+    bridge = pd.concat(rows, ignore_index=True)
+    n = len(bridge)
+    date_min = bridge["meeting_date"].min().date()
+    date_max = bridge["meeting_date"].max().date()
+    print(f"  [VXTYN bridge] {n} rows ({date_min} → {date_max}) across "
+          f"{bridge['etf'].nunique()} ETFs")
+    return bridge
+
+
+# ── 3d2. MOVE-index bridge (post-2020 IV from ICE BofA MOVE via Yahoo Finance) ─
+
+# Calibrated from VXTYN history (2010-2020): tenor_yield_bps = MOVE × ratio
+# Conversion: price_vol_pct = yield_bps × duration / 100
+_MOVE_YIELD_RATIO: dict[str, float] = {
+    "2Y":  1.5679,
+    "5Y":  1.7516,
+    "10Y": 1.7323,
+    "20Y": 1.7115,
+    "30Y": 1.5413,
+}
+_MOVE_TICKER = "^MOVE"
+_MOVE_CACHE: dict[str, pd.Series] = {}   # keyed by "start:end"
+
+
+def _load_move_series(start: str = "2010-01-01", end: str | None = None) -> pd.Series:
+    import yfinance as yf
+    end = end or pd.Timestamp.today().strftime("%Y-%m-%d")
+    key = f"{start}:{end}"
+    if key not in _MOVE_CACHE:
+        raw = yf.download(_MOVE_TICKER, start=start, end=end, progress=False)
+        if raw.empty:
+            _MOVE_CACHE[key] = pd.Series(dtype=float)
+        else:
+            col = ("Close", _MOVE_TICKER) if ("Close", _MOVE_TICKER) in raw.columns else "Close"
+            _MOVE_CACHE[key] = raw[col].squeeze().rename("MOVE")
+    return _MOVE_CACHE[key]
+
+
+def seed_iv_from_move_bridge(
+    fomc_dates: list[pd.Timestamp] | None = None,
+    etf_map: dict[str, str] | None = None,
+    after_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """
+    Estimate ETF implied vol from the ICE BofA MOVE Index (Yahoo Finance ^MOVE).
+
+    Formula (calibrated on VXTYN 2010-2020):
+        yield_bps(tenor)   = MOVE × _MOVE_YIELD_RATIO[tenor]
+        price_vol_pct(etf) = yield_bps × _ETF_DURATION[etf] / 100
+        iv_event_var       = (price_vol_pct / 100)^2
+
+    MOVE is 30-day blend of 2Y/5Y/10Y/30Y yield option vol (weighted 0.2/0.2/0.4/0.2).
+    Basis caveats:
+      - ETF duration proxy, not true Treasury duration (same as VXTYN bridge)
+      - MOVE is blended across tenors; per-tenor decomposition uses calibrated ratios
+      - 30-day forward-looking vol may overshoot/undershoot the 1-day FOMC event
+    Source tag: 'move_bridge' — use where VXTYN bridge is unavailable (post-2020).
+    """
+    etf_map = etf_map or ETF_MAP
+    after_date = after_date or _VXTYN_END
+
+    move = _load_move_series()
+    if move.empty:
+        print("  [MOVE bridge] ^MOVE download failed — skipping")
+        return pd.DataFrame()
+
+    if fomc_dates is None:
+        dates = [d for d in move.index if d > after_date]
+    else:
+        dates = [d for d in fomc_dates if d > after_date]
+
+    rows = []
+    for fomc_dt in dates:
+        # Use obs_date (FOMC - 2 biz days)
+        obs_dt = fomc_dt - pd.offsets.BDay(2)
+        obs_dt = move.index[move.index <= obs_dt].max() if not move.index[move.index <= obs_dt].empty else None
+        if obs_dt is None:
+            continue
+        move_val = float(move.loc[obs_dt])
+        if np.isnan(move_val):
+            continue
+
+        for tenor, etf in _VXTYN_TENOR_TO_ETF.items():
+            if etf not in etf_map:
+                continue
+            ratio = _MOVE_YIELD_RATIO.get(tenor)
+            dur   = _ETF_DURATION.get(etf)
+            if ratio is None or dur is None:
+                continue
+            yield_bps       = move_val * ratio
+            price_vol_pct   = yield_bps * dur / 100
+            iv_event_var    = (price_vol_pct / 100) ** 2
+            rows.append({
+                "meeting_date":       fomc_dt,
+                "etf":                etf,
+                "tenor_proxy":        etf_map[etf],
+                "iv_event_var":       iv_event_var,
+                "iv_event_vol_pct":   price_vol_pct,
+                "source":             "move_bridge",
+                "window_flag":        f"move_30d_kink(obs={obs_dt.date()},MOVE={move_val:.1f})",
+                "expiry_pre":         pd.NaT,
+                "expiry_post":        pd.NaT,
+                "T_pre_years":        np.nan,
+                "T_post_years":       np.nan,
+                "iv_pre_pct":         np.nan,
+                "iv_post_pct":        np.nan,
+            })
+
+    if not rows:
+        print("  [MOVE bridge] no rows generated — check FOMC dates or ^MOVE data range")
+        return pd.DataFrame()
+
+    bridge = pd.DataFrame(rows)
+    n = len(bridge)
+    d0 = bridge["meeting_date"].min().date()
+    d1 = bridge["meeting_date"].max().date()
+    d0_ts, d1_ts = pd.Timestamp(d0), pd.Timestamp(d1)
+    move_range = f"{move.loc[move.index >= d0_ts].min():.0f}–{move.loc[move.index <= d1_ts].max():.0f}"
+    print(f"  [MOVE bridge] {n} rows ({d0} → {d1}) MOVE range ≈ {move_range} bps")
+    return bridge
+
+
+# ── 3e. Main implied vol builder ──────────────────────────────────────────────
 
 def build_implied_curve(fomc_dates: list[pd.Timestamp],
                         etf_map: dict[str, str] | None = None,
-                        ohlc_cache: dict[str, pd.DataFrame] | None = None) -> pd.DataFrame:
+                        ohlc_cache: dict[str, pd.DataFrame] | None = None,
+                        use_vxtyn_bridge: bool = True) -> pd.DataFrame:
     """
     For each FOMC meeting × ETF, attempt to build iv_event_var using:
-      1. WRDS/OptionMetrics (if WRDS_USERNAME set)
-      2. AlphaVantage HISTORICAL_OPTIONS (if ALPHAVANTAGE_API_KEY set)
-      3. Manual CSV fallback
+      0a. VXTYN bridge — vrp_panel.parquet (pre-2020)
+      0b. MOVE bridge  — ^MOVE Yahoo Finance (post-2020, yield→price-vol via duration)
+      1.  WRDS/OptionMetrics (if WRDS_USERNAME set)
+      2.  AlphaVantage HISTORICAL_OPTIONS (if ALPHAVANTAGE_API_KEY set)
+      3.  Manual CSV fallback
+    WRDS/AV/manual override the bridges for the same (meeting, etf) when available.
     Output: (meeting_date, etf, tenor_proxy, iv_event_var, iv_event_vol_pct,
              iv_percentile, source, expiry_pre, expiry_post, window_flag)
     """
     etf_map = etf_map or ETF_MAP
     manual_df = load_manual_iv()
+
+    # Source 0a: VXTYN bridge — seed pre-2020 IV from vrp_panel
+    # Source 0b: MOVE bridge  — seed post-2020 IV from ^MOVE (Yahoo Finance)
+    # Higher-priority sources (WRDS, AV, manual) override these for any (meeting, etf).
+    bridge_lookup: dict[tuple, dict] = {}
+    if use_vxtyn_bridge:
+        bridge_df = seed_iv_from_vxtyn_bridge(etf_map=etf_map)
+        for _, r in bridge_df.iterrows():
+            bridge_lookup[(pd.Timestamp(r["meeting_date"]), r["etf"])] = r.to_dict()
+        # MOVE bridge fills post-VXTYN gaps
+        move_df = seed_iv_from_move_bridge(fomc_dates=fomc_dates, etf_map=etf_map)
+        for _, r in move_df.iterrows():
+            key = (pd.Timestamp(r["meeting_date"]), r["etf"])
+            if key not in bridge_lookup:   # don't overwrite VXTYN data
+                bridge_lookup[key] = r.to_dict()
 
     print(f"\n[Layer 3] ETF implied vol: {list(etf_map.keys())} × {len(fomc_dates)} meetings")
     if not AV_API_KEY:
@@ -643,6 +861,21 @@ def build_implied_curve(fomc_dates: list[pd.Timestamp],
 
             bracket: dict | None = None
             source = "missing"
+
+            # ── Source 0: VXTYN bridge (pre-2020 seed) ────────────────────────
+            bridge_row = bridge_lookup.get((fomc_dt, ticker))
+            if bridge_row is not None:
+                bracket = {
+                    "iv_pre_pct":  bridge_row.get("iv_pre_pct", np.nan),
+                    "iv_post_pct": bridge_row.get("iv_post_pct", np.nan),
+                    "expiry_pre":  bridge_row.get("expiry_pre", pd.NaT),
+                    "expiry_post": bridge_row.get("expiry_post", pd.NaT),
+                    "window_flag": bridge_row.get("window_flag", "vxtyn_30d_kink"),
+                    # Pre-computed iv_event_var — bypass the T_pre/T_post formula
+                    "_iv_event_var_override": bridge_row["iv_event_var"],
+                    "_iv_event_vol_override": bridge_row["iv_event_vol_pct"],
+                }
+                source = bridge_row.get("source", "vxtyn_bridge")
 
             # ── Source 1: WRDS / OptionMetrics ────────────────────────────────
             if bracket is None and WRDS_USER:
@@ -688,36 +921,51 @@ def build_implied_curve(fomc_dates: list[pd.Timestamp],
                     source = f"manual_csv:{m.get('source_note','')}"
 
             # ── Compute iv_event_var from bracket ─────────────────────────────
-            if bracket is not None and obs_dt is not None:
-                iv_pre_frac  = bracket["iv_pre_pct"]  / 100.0
-                iv_post_frac = bracket["iv_post_pct"] / 100.0
-                expiry_pre   = pd.Timestamp(bracket["expiry_pre"])
-                expiry_post  = pd.Timestamp(bracket["expiry_post"])
-                T_pre  = max(0.0, (expiry_pre  - obs_dt).days / 365.25)
-                T_post = max(0.0, (expiry_post - obs_dt).days / 365.25)
+            if bracket is not None:
+                # VXTYN bridge supplies pre-computed values; skip the expiry-kink formula
+                if "_iv_event_var_override" in bracket:
+                    iv_event_var     = float(bracket["_iv_event_var_override"])
+                    iv_event_vol_pct = float(bracket["_iv_event_vol_override"])
+                    rec.update({
+                        "iv_pre_pct":       np.nan,
+                        "iv_post_pct":      np.nan,
+                        "expiry_pre":       pd.NaT,
+                        "expiry_post":      pd.NaT,
+                        "T_pre_years":      np.nan,
+                        "T_post_years":     np.nan,
+                        "iv_event_var":     iv_event_var,
+                        "iv_event_vol_pct": iv_event_vol_pct,
+                        "window_flag":      bracket.get("window_flag", "vxtyn_30d_kink"),
+                        "source":           source,
+                    })
+                elif obs_dt is not None:
+                    iv_pre_frac  = bracket["iv_pre_pct"]  / 100.0
+                    iv_post_frac = bracket["iv_post_pct"] / 100.0
+                    expiry_pre   = pd.Timestamp(bracket["expiry_pre"])
+                    expiry_post  = pd.Timestamp(bracket["expiry_post"])
+                    T_pre  = max(0.0, (expiry_pre  - obs_dt).days / 365.25)
+                    T_post = max(0.0, (expiry_post - obs_dt).days / 365.25)
 
-                # Event variance via expiry kink:
-                #   iv_event_var = σ_post² × T_post - σ_pre² × T_pre   [fraction²]
-                # Both in lognormal-variance space, same convention as GK realized vol.
-                iv_event_var = iv_post_frac**2 * T_post - iv_pre_frac**2 * T_pre
+                    # Event variance via expiry kink:
+                    #   iv_event_var = σ_post² × T_post - σ_pre² × T_pre   [fraction²]
+                    iv_event_var = iv_post_frac**2 * T_post - iv_pre_frac**2 * T_pre
+                    T_event = max(T_post - T_pre, 1.0 / 365.25)
+                    iv_event_vol_pct = sqrt(max(0.0, iv_event_var) / T_event) * 100
 
-                # Back out an effective ATM annualised vol for the event window
-                # (used for cross-checks and percentile ranking)
-                T_event = max(T_post - T_pre, 1.0 / 365.25)
-                iv_event_vol_pct = sqrt(max(0.0, iv_event_var) / T_event) * 100
-
-                rec.update({
-                    "iv_pre_pct":     bracket["iv_pre_pct"],
-                    "iv_post_pct":    bracket["iv_post_pct"],
-                    "expiry_pre":     expiry_pre,
-                    "expiry_post":    expiry_post,
-                    "T_pre_years":    T_pre,
-                    "T_post_years":   T_post,
-                    "iv_event_var":   iv_event_var,
-                    "iv_event_vol_pct": iv_event_vol_pct,
-                    "window_flag":    bracket.get("window_flag", "unknown"),
-                    "source":         source,
-                })
+                    rec.update({
+                        "iv_pre_pct":       bracket["iv_pre_pct"],
+                        "iv_post_pct":      bracket["iv_post_pct"],
+                        "expiry_pre":       expiry_pre,
+                        "expiry_post":      expiry_post,
+                        "T_pre_years":      T_pre,
+                        "T_post_years":     T_post,
+                        "iv_event_var":     iv_event_var,
+                        "iv_event_vol_pct": iv_event_vol_pct,
+                        "window_flag":      bracket.get("window_flag", "unknown"),
+                        "source":           source,
+                    })
+                else:
+                    bracket = None  # no obs_dt available; fall through to NaN
             else:
                 for c in ("iv_pre_pct","iv_post_pct","expiry_pre","expiry_post",
                           "T_pre_years","T_post_years","iv_event_var",
