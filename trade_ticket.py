@@ -40,9 +40,16 @@ CFG: dict = dict(
     # ── Strike grid (snap ATM-forward to nearest tick) ─────────────────────────
     STRIKE_GRID_PTS    = 0.250,      # 1/4-pt = typical short-dated OTM grid
 
-    # ── Expiry ─────────────────────────────────────────────────────────────────
-    T_CALENDAR_DAYS    = 9,          # calendar days to post-FOMC weekly expiry
-                                     # (FOMC Wed → next-Friday ≈ 9 calendar days)
+    # ── Dates — set all three; T_CALENDAR_DAYS is derived, do NOT set manually ─
+    # ENTRY_DATE : when you put the trade on (ISO format YYYY-MM-DD)
+    # FOMC_DATE  : FOMC announcement day (Wednesday)
+    # EXPIRY_DATE: post-FOMC weekly option expiry (Friday after FOMC week)
+    #              Days from FOMC Wed → next-Friday = 9 calendar days.
+    #              Days from FOMC Wed → same-week-Friday = 2 calendar days (too short).
+    #              Use the LISTED expiry from OMON — do not guess.
+    ENTRY_DATE         = "2026-06-24",  # today — actual trade entry date
+    FOMC_DATE          = "YYYY-MM-DD",  # PLACEHOLDER — next FOMC Wednesday
+    EXPIRY_DATE        = "YYYY-MM-DD",  # PLACEHOLDER — post-FOMC weekly expiry from OMON
 
     # ── DV01: $ change per 1 bp of yield per $1,000,000 face ──────────────────
     # DV01 ≈ mod_duration × spot_price/100 × 10,000  — GET THESE FROM OMON/BBG
@@ -322,8 +329,29 @@ def compute_trade_ticket(cfg: dict = CFG) -> dict:
     F2   = cfg["F_2Y_PTS"];       F30  = cfg["F_30Y_PTS"]
     Y2   = cfg["Y_2Y_PCT"];       Y30  = cfg["Y_30Y_PCT"]
     grid = cfg["STRIKE_GRID_PTS"]
-    T_cd = cfg["T_CALENDAR_DAYS"]
-    T    = T_cd / 365.0          # years (calendar-day convention)
+
+    # Derive T from real dates (preferred) or fall back to legacy T_CALENDAR_DAYS
+    entry_str  = cfg.get("ENTRY_DATE",  "")
+    fomc_str   = cfg.get("FOMC_DATE",   "")
+    expiry_str = cfg.get("EXPIRY_DATE", "")
+
+    _date_placeholder = lambda s: not s or s.startswith("YYYY")
+
+    if not _date_placeholder(entry_str) and not _date_placeholder(expiry_str):
+        entry_dt  = date.fromisoformat(entry_str)
+        expiry_dt = date.fromisoformat(expiry_str)
+        if expiry_dt <= entry_dt:
+            raise ValueError(f"EXPIRY_DATE ({expiry_str}) must be after ENTRY_DATE ({entry_str})")
+        T_cd = (expiry_dt - entry_dt).days
+    else:
+        # Legacy fallback: use T_CALENDAR_DAYS if dates not set
+        T_cd      = cfg.get("T_CALENDAR_DAYS", 9)
+        entry_dt  = date.today()
+        expiry_dt = None
+
+    fomc_dt = date.fromisoformat(fomc_str) if not _date_placeholder(fomc_str) else None
+
+    T = T_cd / 365.0          # years (calendar-day convention)
 
     dv01_2y  = cfg["DV01_2Y_PER_1M"]
     dv01_30y = cfg["DV01_30Y_PER_1M"]
@@ -401,6 +429,13 @@ def compute_trade_ticket(cfg: dict = CFG) -> dict:
     print()
     _hdr("FOMC TWO-LEG VOL STEEPENER  ·  TRADE TICKET")
     print(f"  Generated : {date.today()}   |   Pricer: Bachelier (normal-vol, in-house)")
+
+    # ── Date timeline ──────────────────────────────────────────────────────────
+    fomc_display   = fomc_dt.isoformat()   if fomc_dt   else "YYYY-MM-DD  ← SET FOMC_DATE"
+    expiry_display = expiry_dt.isoformat() if expiry_dt else "YYYY-MM-DD  ← SET EXPIRY_DATE"
+    days_to_fomc   = (fomc_dt - entry_dt).days if fomc_dt else "?"
+    print(f"  Entry date: {entry_str}   │   FOMC date : {fomc_display}  ({days_to_fomc}d away)")
+    print(f"  Expiry    : {expiry_display}   │   T to expiry: {T_cd} calendar days  ({T:.5f} yr)")
     print(f"  Vol source: {sigma_source}  |  {'⚠  OVERWRITE LEVELS FROM OMON / SCREEN BEFORE TRADING' if sigma_source != 'OMON override' else 'IV from OMON ✓'}")
     print(_bar())
 
@@ -413,7 +448,6 @@ def compute_trade_ticket(cfg: dict = CFG) -> dict:
     _row("Strike (px)",   f"{K2:.3f} pts   ≈  {K2_yield:.4f}% yield")
     _row("Notional",      f"${n2:>20,.0f}   [VEGA-NEUTRAL SOLVE ← see below]")
     _row("Contracts",     f"{tk2['contracts']:,}   (@ ${face_zt:,.0f} face/contract)")
-    _row("T to expiry",   f"{T_cd} calendar days  ({T:.5f} yr)")
     _sep()
     _row("Normal vol σ",  f"{sigma_n_2y:.4f} pts/yr   ({ev_sd_2y:.1f} bp/day yield equiv)")
     _row("DV01 / $1M",    f"${dv01_2y:,.2f} / bp")
@@ -434,7 +468,6 @@ def compute_trade_ticket(cfg: dict = CFG) -> dict:
     _row("Strike (px)",   f"{K30:.3f} pts   ≈  {K30_yield:.4f}% yield")
     _row("Notional",      f"${n30:>20,.0f}   [ANCHOR — desk minimum]")
     _row("Contracts",     f"{tk30['contracts']:,}   (@ ${face_zb:,.0f} face/contract)")
-    _row("T to expiry",   f"{T_cd} calendar days  ({T:.5f} yr)")
     _sep()
     _row("Normal vol σ",  f"{sigma_n_30y:.4f} pts/yr   ({ev_sd_30y:.1f} bp/day yield equiv)")
     _row("DV01 / $1M",    f"${dv01_30y:,.2f} / bp")

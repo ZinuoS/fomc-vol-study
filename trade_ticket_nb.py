@@ -44,11 +44,25 @@ from trade_ticket import (
 # ## Configuration
 #
 # All levels below are **PLACEHOLDER**.  Before submitting:
-# 1. Overwrite `F_2Y_PTS`, `F_30Y_PTS`, `Y_2Y_PCT`, `Y_30Y_PCT` from OMON screen
-# 2. Overwrite `DV01_2Y_PER_1M`, `DV01_30Y_PER_1M` from OMON (exact futures DV01)
-# 3. Set `SIGMA_N_2Y_OVERRIDE` / `SIGMA_N_30Y_OVERRIDE` = OMON ATM IV (for premium)
-# 4. Set `SIGMA_2Y_YIELD_BPS_DAY` / `SIGMA_30Y_YIELD_BPS_DAY` from GapSpread model
+# 1. Set `ENTRY_DATE` (today), `FOMC_DATE` (next FOMC Wednesday), `EXPIRY_DATE`
+#    (post-FOMC weekly expiry from OMON) — `T_CALENDAR_DAYS` is derived automatically
+# 2. Overwrite `F_2Y_PTS`, `F_30Y_PTS`, `Y_2Y_PCT`, `Y_30Y_PCT` from OMON screen
+# 3. Overwrite `DV01_2Y_PER_1M`, `DV01_30Y_PER_1M` from OMON (exact futures DV01)
+# 4. Set `SIGMA_N_2Y_OVERRIDE` / `SIGMA_N_30Y_OVERRIDE` = OMON ATM IV (for premium)
+# 5. Set `SIGMA_2Y_YIELD_BPS_DAY` / `SIGMA_30Y_YIELD_BPS_DAY` from GapSpread model
 #    (or use ETF pipeline values — see the last cell)
+#
+# ### Date timeline
+#
+# ```
+# ENTRY_DATE ──────────────────── FOMC_DATE ──── EXPIRY_DATE
+#   (today / trade entry)        (Wed 2pm)       (following Friday)
+#         ↑                           ↑                 ↑
+#  T_CALENDAR_DAYS = (EXPIRY_DATE − ENTRY_DATE).days  (derived, not set)
+# ```
+#
+# The expiry is the **post-FOMC weekly option** listed on OMON, not the nearest
+# Friday. FOMC Wed → same-week Friday = 2 days (too short). FOMC Wed → next Friday = 9 days.
 
 # %% ── Run trade ticket ───────────────────────────────────────────────────────
 
@@ -169,7 +183,8 @@ print("Saved: fomc_viz/fig_trade_ticket_mc.png")
 
 # %% ── Sizing sensitivity sweep ───────────────────────────────────────────────
 
-T = CFG["T_CALENDAR_DAYS"] / 365.0
+T    = result["T"]       # derived from ENTRY_DATE / EXPIRY_DATE
+T_cd = result["T_days"]
 dv01_2y  = CFG["DV01_2Y_PER_1M"]
 dv01_30y = CFG["DV01_30Y_PER_1M"]
 sigma_n_2y  = sigma_price_from_event_sd(CFG["SIGMA_2Y_YIELD_BPS_DAY"], dv01_2y)
