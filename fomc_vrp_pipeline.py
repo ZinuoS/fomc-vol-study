@@ -639,18 +639,23 @@ def _build_implied_from_tyvix(tyvix_df: pd.DataFrame,
         past_tyvix = tyvix_df[tyvix_df.index < ts]["TYVIX"]
         pctile = float((past_tyvix < tv_pre).mean() * 100) if len(past_tyvix) > 10 else 50.0
 
+        # Convert 10Y price vol → 10Y yield vol in bps via empirical duration
+        # _dur_10y and _fomc_yield_ratios are globals set after realized_curve is built
+        iv_10y_bps = iv_10y * 100.0 / max(_dur_10y, 1.0)
+
         for tenor in TENORS:
-            scale = price_vol_ratios.get(tenor, 1.0)
+            pscale = price_vol_ratios.get(tenor, 1.0)
+            yscale = _fomc_yield_ratios.get(tenor, 1.0)
             rows.append({
                 "meeting_date":  ts,
                 "tenor":         tenor,
-                "iv_event_vol":  iv_10y * scale,   # annualised % price vol, tenor-scaled
+                "iv_event_vol":  iv_10y * pscale,     # annualised % price vol (futures tenors)
+                "iv_event_bps":  iv_10y_bps * yscale, # annualised bps yield vol (all tenors)
                 "iv_percentile": pctile,
                 "tyvix_pre":     tv_pre,
                 "tyvix_post":    tv_post,
-                "tenor_scale":   scale,
                 "iv_stripped":   var_stripped > 0,
-                "vxtyn_covered": True,             # flag: FRED VXTYN data exists
+                "vxtyn_covered": True,
             })
     df = pd.DataFrame(rows)
     df["meeting_date"] = pd.to_datetime(df["meeting_date"])
@@ -661,6 +666,34 @@ def _build_implied_from_tyvix(tyvix_df: pd.DataFrame,
 _price_vol_ratios = _compute_price_vol_ratios(ohlc_data)
 print(f"\nPrice-vol ratios (vs 10Y ZN): "
       + "  ".join(f"{t}={v:.3f}" for t, v in sorted(_price_vol_ratios.items())))
+
+# ── Compute yield-vol scaling factors from FOMC-day realized data ─────────────
+# These are computed from realized_curve (must run after section 1).
+# We use FOMC-day yield-change vol means (bps), not full-sample daily yield stds,
+# because FOMC-day sensitivity is what we want to capture in the VRP model.
+#
+# Why yield-vol space for the regression (not price-vol)?
+#   • 30Y price vol is 1.9× 10Y price vol purely due to duration (18 vs 7 years).
+#     In price-vol, 30Y always "wins" the VRP gap — that's a duration artifact,
+#     not an economic signal about FOMC communication.
+#   • In yield-vol (bps), the gap is comparable across tenors. The front end (2Y, 5Y)
+#     captures FOMC rate-path sensitivity; the long end captures term-premium shifts.
+#     The NLP regression should see different tenor loadings in this space.
+#
+_rc_yc_means = (realized_curve.groupby("tenor")["rv_event_yc"]
+                .mean().fillna(0).to_dict())
+_rc_gk_means = (realized_curve.groupby("tenor")["rv_event_gk"]
+                .mean().fillna(0).to_dict())
+# Empirical modified duration of 10Y futures: price_vol% × 100 / yield_vol_bps
+_dur_10y = float(_rc_gk_means.get("10Y", 5.8) * 100
+                 / max(_rc_yc_means.get("10Y", 72.3), 1.0))
+# FOMC-day yield ratios vs 10Y: how much does each tenor yield move on FOMC days?
+_base_yc = max(_rc_yc_means.get("10Y", 72.3), 1.0)
+_fomc_yield_ratios = {t: float(v / _base_yc) for t, v in _rc_yc_means.items()}
+print(f"FOMC yield ratios (vs 10Y bps):  "
+      + "  ".join(f"{t}={v:.3f}" for t, v in sorted(_fomc_yield_ratios.items())))
+print(f"Empirical 10Y futures duration: {_dur_10y:.2f} yrs  "
+      f"(price vol / yield vol × 100)")
 
 # ── Try TYVIX ─────────────────────────────────────────────────────────────────
 _tyvix_df = fetch_tyvix()
@@ -736,52 +769,78 @@ def compute_vrp_gap(realized: pd.DataFrame, implied: pd.DataFrame) -> pd.DataFra
     """
     Merge realized and implied curves; compute VRP gap in variance space.
 
-    Unit consistency rule (critical):
-      Futures tenors (2Y, 5Y, 10Y, 30Y):
-        rv_event_gk  = GK on OHLC of the futures contract  [annualised % PRICE vol]
-        iv_event_vol = VXTYN stripped via Black-76          [annualised % PRICE vol]
-        gap_var      = (iv/100)² − (rv/100)²               [valid, same units]
+    Two VRP gap measures are computed:
 
-      Cash-only tenors (7Y, 20Y):
-        rv_event_yc  = |Δyield| × sqrt(252)                [annualised bps YIELD vol]
-        iv_event_vol = VXTYN × price_vol_ratio (interpolated) [annualised % PRICE vol]
-        gap_var      = NaN  ← CANNOT subtract bps from % price vol
+    1. gap_var  (% price-vol space, futures tenors only):
+         rv_event_gk [% ann.]  vs  iv_event_vol [% ann.]
+         gap_var = (iv/100)² − (rv/100)²      [valid only where OHLC exists]
+         Cash-only tenors → NaN (% price vol vs bps yield vol is undefined)
 
-      gap_var > 0 → IV > RV → straddle was over-priced → short-vol trade profitable
-      gap_var < 0 → IV < RV → straddle was under-priced → rare; may signal stress
+    2. gap_yc   (bps yield-vol space, ALL tenors):
+         rv_event_yc [bps ann.]  vs  iv_event_bps [bps ann.]
+         iv_event_bps = VXTYN_10Y_stripped × (100/dur_10Y) × fomc_yield_ratio[tenor]
+         gap_yc_bps  = iv_bps − rv_bps       [+ = IV > RV, sell vol wins]
+         gap_yc_bps2 = iv_bps² − rv_bps²     [variance space, used as regression target]
+
+    Gap_yc is the PRIMARY target for NLP regression because:
+      • Valid for all 6 tenors (including 7Y, 20Y), doubling the dataset
+      • Comparable across tenors: removes the duration-driven size difference
+      • More FOMC-relevant: Fed guides short rates → 2Y/5Y should load most on NLP factors
     """
     rv_sel = realized[["meeting_date","tenor","rv_event_gk","rv_event_yc",
-                         "rv_event_park","cash_only_flag","estimator_type"]].copy()
-    impl   = implied[["meeting_date","tenor","iv_event_vol","iv_percentile"]].copy()
+                        "rv_event_park","cash_only_flag","estimator_type"]].copy()
+    iv_cols = ["meeting_date","tenor","iv_event_vol","iv_event_bps","iv_percentile"]
+    impl    = implied[[c for c in iv_cols if c in implied.columns]].copy()
 
     panel = rv_sel.merge(impl, on=["meeting_date","tenor"], how="left")
 
-    # For futures tenors only: both IV and RV in % price vol → gap is meaningful
+    # ── Price-space gap (futures tenors only) ─────────────────────────────────
     panel["rv_event_var"] = np.where(
         panel["cash_only_flag"],
-        np.nan,                                  # cash-only: unit mismatch → NaN
+        np.nan,
         (panel["rv_event_gk"] / 100) ** 2,
     )
     panel["iv_event_var"] = np.where(
-        panel["cash_only_flag"],
+        panel["cash_only_flag"] | panel["iv_event_vol"].isna(),
         np.nan,
         (panel["iv_event_vol"] / 100) ** 2,
     )
-    # gap_var sign convention: IV − RV (positive = vol was over-priced, sell-vol wins)
     panel["gap_var"] = panel["iv_event_var"] - panel["rv_event_var"]
+
+    # ── Yield-space gap (all tenors) ──────────────────────────────────────────
+    if "iv_event_bps" in panel.columns:
+        panel["gap_yc_bps"]  = panel["iv_event_bps"] - panel["rv_event_yc"]
+        panel["gap_yc_bps2"] = panel["iv_event_bps"] ** 2 - panel["rv_event_yc"] ** 2
+    else:
+        panel["gap_yc_bps"]  = np.nan
+        panel["gap_yc_bps2"] = np.nan
 
     print(f"\nVRP panel: {panel.shape}")
     print(f"  IV source: {_iv_source}")
-    print(f"  gap_var = IV_var − RV_var  (+ = IV > RV, sell-vol wins; cash tenors = NaN)")
-    gp = panel.groupby("tenor")["gap_var"]
-    for tenor, grp in gp:
+    print(f"\n  ── Price-vol gap (% ann., futures tenors only) ──")
+    for tenor, grp in panel.groupby("tenor")["gap_var"]:
         valid = grp.dropna()
-        cash = TENORS[tenor].get("cash_only", False)
-        tag = " [cash-only, no gap]" if cash else f" mean={valid.mean():.4f}  IV>RV={( valid>0).mean()*100:.0f}%"
-        print(f"    {tenor}  n={valid.notna().sum()}{tag}")
+        if TENORS[tenor].get("cash_only"):
+            print(f"    {tenor:4s}  [cash-only — no price-vol gap]")
+        elif valid.empty:
+            print(f"    {tenor:4s}  n=0")
+        else:
+            print(f"    {tenor:4s}  n={len(valid)}  "
+                  f"mean={valid.mean():+.4f}  IV>RV={( valid>0).mean()*100:.0f}%")
+
+    print(f"\n  ── Yield-vol gap (bps ann., ALL tenors) ──")
+    for tenor, grp in panel.groupby("tenor")["gap_yc_bps"]:
+        valid = grp.dropna()
+        if valid.empty:
+            print(f"    {tenor:4s}  n=0")
+        else:
+            print(f"    {tenor:4s}  n={len(valid)}  "
+                  f"IV={panel.loc[grp.index,'iv_event_bps'].dropna().mean():5.1f}bps  "
+                  f"RV={panel.loc[grp.index,'rv_event_yc'].dropna().mean():5.1f}bps  "
+                  f"gap={valid.mean():+.1f}bps  IV>RV={( valid>0).mean()*100:.0f}%")
+
     if _iv_source == "proxy":
-        print("  ⚠  gap_var ≈ 0 in proxy mode (IV = smoothed RV). "
-              "Add FRED VXTYN cache or Bloomberg IV for true VRP.")
+        print("  ⚠  Proxy IV: gaps ≈ 0 by construction. Add FRED VXTYN cache.")
     return panel
 
 
@@ -1380,7 +1439,7 @@ validate_claude_vs_lexicon(claude_scores, feats_df)
 # %% [markdown]
 # ---
 # # LAYER 5 — FORECASTING THE GAP (elastic-net, walk-forward)
-# Panel: (meeting_date, tenor). Target = gap_var (variance space).
+# Panel: (meeting_date × tenor). Target = gap_yc_bps2 (yield-vol variance, bps²; all 6 tenors).
 # Walk-forward expanding window; cluster SE by meeting.
 
 # %% ── 5a. Build forecasting panel ────────────────────────────────────────────
@@ -1413,19 +1472,22 @@ def build_panel(vrp_panel: pd.DataFrame, claude_scores: pd.DataFrame,
     cf["meeting_date"] = pd.to_datetime(cf["meeting_date"])
 
     # VRP panel (meeting × tenor)
-    vp = vrp_panel[["meeting_date","tenor","gap_var","rv_event_var",
-                    "iv_percentile","cash_only_flag","estimator_type"]].copy()
+    vp_cols = ["meeting_date","tenor","gap_var","gap_yc_bps","gap_yc_bps2",
+               "rv_event_var","rv_event_yc","iv_event_bps",
+               "iv_percentile","cash_only_flag","estimator_type"]
+    vp = vrp_panel[[c for c in vp_cols if c in vrp_panel.columns]].copy()
     vp["meeting_date"] = pd.to_datetime(vp["meeting_date"])
     vp["tenor_code"] = vp["tenor"].map(TENOR_CODE).fillna(2).astype(int)
 
     # Merge
     panel = (vp
-             .merge(cf,    on="meeting_date", how="left")
+             .merge(cf,      on="meeting_date", how="left")
              .merge(ctrl_df, on="meeting_date", how="left"))
 
-    # Lagged rv_event_var per tenor (shift by 1 meeting)
+    # Lagged AR terms per tenor (shift by 1 meeting, sorted by tenor then date)
     panel = panel.sort_values(["tenor","meeting_date"])
-    panel["rv_lag1"] = panel.groupby("tenor")["rv_event_var"].shift(1)
+    panel["rv_lag1"]    = panel.groupby("tenor")["rv_event_var"].shift(1)
+    panel["rv_yc_lag1"] = panel.groupby("tenor")["rv_event_yc"].shift(1)
 
     # Tenor × factor interactions
     panel["f1_x_tenor"] = panel["factor_1"] * panel["tenor_code"]
@@ -1442,7 +1504,8 @@ def build_panel(vrp_panel: pd.DataFrame, claude_scores: pd.DataFrame,
             panel[f"regime_{r}"] = (panel["regime_id"] == r).astype(float)
 
     print(f"\nForecasting panel: {panel.shape}  tenors={panel['tenor'].unique().tolist()}")
-    print(f"  Target (gap_var) non-null: {panel['gap_var'].notna().sum()}")
+    print(f"  Target gap_yc_bps2 non-null: {panel['gap_yc_bps2'].notna().sum()}"
+          f"  (gap_var non-null: {panel['gap_var'].notna().sum()})")
     return panel.reset_index(drop=True)
 
 
@@ -1452,12 +1515,18 @@ forecast_panel = build_panel(vrp_panel, claude_scores, feats_df)
 
 def _get_feature_cols(panel: pd.DataFrame) -> list[str]:
     """Return all usable feature columns (no leakage, no target)."""
-    drop_cols = {"meeting_date","tenor","gap_var","rv_event_var","iv_event_var",
-                 "rv_event_yc","rv_event_gk","rv_event_park","rv_primary",
-                 "iv_event_vol","cash_only_flag","estimator_type","regime_id",
-                 "_source","_error"}
+    drop_cols = {
+        "meeting_date","tenor",
+        "gap_var","gap_yc_bps","gap_yc_bps2",    # targets — never leak
+        "rv_event_var","iv_event_var",             # price-space intermediates
+        "rv_event_yc","rv_event_gk","rv_event_park","rv_primary",
+        "iv_event_vol","iv_event_bps",
+        "cash_only_flag","estimator_type","regime_id",
+        "_source","_error",
+    }
     return [c for c in panel.columns
-            if c not in drop_cols and panel[c].dtype in (float, int, np.float64, np.int64)
+            if c not in drop_cols
+            and panel[c].dtype in (float, int, np.float64, np.int64)
             and not c.startswith("_")]
 
 
@@ -1472,7 +1541,7 @@ def fit_walkforward(panel: pd.DataFrame,
     """
     meetings     = sorted(panel["meeting_date"].unique())
     feat_cols    = _get_feature_cols(panel)
-    target_col   = "gap_var"
+    target_col   = "gap_yc_bps2"   # yield-vol variance space (bps²); all 6 tenors valid
 
     all_preds = []
 
@@ -1529,10 +1598,10 @@ def fit_walkforward(panel: pd.DataFrame,
     df = pd.DataFrame(all_preds)
     df["meeting_date"] = pd.to_datetime(df["meeting_date"])
 
-    # OOS R² per tenor
+    # OOS R² per tenor  (target = gap_yc_bps2; all 6 tenors valid)
     print(f"\n{'─'*60}")
-    print(f"  Walk-forward ElasticNet — OOS R² per tenor")
-    print(f"  (n_train starts at {min_train} meetings)")
+    print(f"  Walk-forward ElasticNet — OOS R² per tenor  [target: gap_yc_bps² (bps²)]")
+    print(f"  (n_train starts at {min_train} meetings; all 6 tenors included)")
     print(f"{'─'*60}")
     pooled_hat, pooled_act = [], []
     for t in sorted(df["tenor"].unique()):
@@ -1540,8 +1609,8 @@ def fit_walkforward(panel: pd.DataFrame,
         if len(sub) < 5:
             continue
         r2 = r2_score(sub["gap_actual"], sub["gap_hat"])
-        print(f"  {t:4s}  n={len(sub):3d}  OOS R²={r2:>+6.3f}"
-              + ("  (yield-change estimator — basis vs futures)" if sub["cash_only"].any() else ""))
+        cash_tag = "  [cash-only, yield-RV only]" if sub["cash_only"].any() else ""
+        print(f"  {t:4s}  n={len(sub):3d}  OOS R²={r2:>+6.3f}{cash_tag}")
         pooled_hat.extend(sub["gap_hat"].tolist())
         pooled_act.extend(sub["gap_actual"].tolist())
     if pooled_act:
@@ -1561,7 +1630,7 @@ def print_tenor_factor_matrix(panel: pd.DataFrame) -> pd.DataFrame:
     Hypothesis: front-end loads on specificity/conditionality; long-end on uncertainty.
     """
     feat_cols  = _get_feature_cols(panel)
-    target_col = "gap_var"
+    target_col = "gap_yc_bps2"   # yield-vol variance space; comparable across all 6 tenors
 
     tenor_coefs = []
     for t in sorted(panel["tenor"].unique()):
@@ -1617,8 +1686,8 @@ def build_signal_table(gap_preds: pd.DataFrame,
       z           = gap_hat / sigma_f
       signal_mult = 1 + kappa * max(0, z)
 
-    Sign convention: gap_var = IV_var − RV_var
-      gap_hat > 0  → IV > RV expected → sell-vol signal (straddle was over-priced)
+    Sign convention: gap_yc_bps2 = iv_bps² − rv_bps²  (yield-vol variance space)
+      gap_hat > 0  → IV > RV expected in bps space → sell-vol signal (straddle over-priced)
       gap_hat ≤ 0  → RV > IV expected → no sell-vol edge; flat / reduce size
 
     The signal table is the handoff to fomc_straddle_mc.py:
@@ -1652,7 +1721,8 @@ def build_signal_table(gap_preds: pd.DataFrame,
     print(f"  signal_mult: mean={df['signal_mult'].mean():.3f}  "
           f"max={df['signal_mult'].max():.3f}  "
           f"min={df['signal_mult'].min():.3f}")
-    print(f"  Long signals: {(df['trade_signal']=='long').sum()} / {len(df)}")
+    sell_n = (df["trade_signal"] == "sell_vol").sum()
+    print(f"  Sell-vol signals: {sell_n} / {len(df)}")
     print(f"  Top predicted tenors: {dict(df['trade_tenor'].value_counts().head())}")
     print(f"\n  → Handoff: load gap_forecasts.parquet, join on meeting_date")
     print(f"    mc_cfg.signal_mult = gap_forecasts.loc[meeting, 'signal_mult']")
@@ -1672,10 +1742,9 @@ print(signal_table.tail(5).to_string(index=False))
 
 def eval_sign_hit_rate(gap_preds: pd.DataFrame) -> pd.DataFrame:
     """
-    Did we correctly predict the sign of gap_var (IV_var − RV_var)?
-    gap > 0 → IV > RV → straddle was over-priced → sell-vol trade profitable.
-    Report hit rate per tenor and pooled, with Wilson CI.
-    Naive benchmark: IV > RV ~73-87% of FOMC days → compare model hit rate to that.
+    Did we correctly predict the sign of gap_yc_bps2 (iv_bps² − rv_bps²)?
+    gap > 0 → IV > RV in yield-bps space → straddle was over-priced → sell-vol profitable.
+    Naive benchmark: IV > RV most FOMC days → compare model hit rate to that baseline.
     """
     valid = gap_preds.dropna(subset=["gap_hat","gap_actual"])
 
@@ -1828,51 +1897,64 @@ bootstrap_hit_sharpe(signal_table, gap_preds)
 
 def warsh_vrp_readout(signal_table: pd.DataFrame,
                        gap_preds: pd.DataFrame,
-                       realized_curve: pd.DataFrame) -> None:
-    """Print Warsh June 17 2026 VRP readout: gap_hat, chosen tenor, realized gap."""
+                       realized_curve: pd.DataFrame,
+                       vrp_panel: pd.DataFrame | None = None) -> None:
+    """
+    Print Warsh June 17 2026 VRP readout in yield-vol space (bps).
+    gap_hat and gap_actual are in gap_yc_bps2 (bps²); gap_sqrt is the bps equivalent.
+    """
     warsh_date = pd.Timestamp("2026-06-17")
     sig_row  = signal_table[signal_table["meeting_date"] == warsh_date]
     pred_row = gap_preds[gap_preds["meeting_date"] == warsh_date]
     rv_row   = realized_curve[realized_curve["meeting_date"] == warsh_date]
 
-    print("\n" + "═" * 62)
-    print("  WARSH VRP OUT-OF-SAMPLE READOUT  (June 17, 2026)")
-    print("═" * 62)
+    vrp_panel_row = vrp_panel[vrp_panel["meeting_date"] == warsh_date] if vrp_panel is not None else pd.DataFrame()
+
+    print("\n" + "═" * 66)
+    print("  WARSH VRP OUT-OF-SAMPLE READOUT  (June 17, 2026)  [yield-vol space]")
+    print("═" * 66)
 
     if not sig_row.empty:
         sr = sig_row.iloc[0]
+        gap_bps = float(np.sqrt(abs(sr["gap_hat"]))) * np.sign(sr["gap_hat"])
         print(f"  Trade tenor   : {sr['trade_tenor']}")
-        print(f"  gap_hat       : {sr['gap_hat']:+.6f}  (variance space)")
-        print(f"  sigma_f       : {sr['sigma_f']:.6f}")
+        print(f"  gap_hat       : {sr['gap_hat']:+.1f} bps²  "
+              f"(≈ {gap_bps:+.1f} bps yield-vol spread)")
+        print(f"  sigma_f       : {sr['sigma_f']:.1f} bps²")
         print(f"  z-score       : {sr['z']:+.3f}")
-        print(f"  signal_mult   : {sr['signal_mult']:.3f}  "
-              f"(→ MCConfig.signal_mult)")
+        print(f"  signal_mult   : {sr['signal_mult']:.3f}  (→ MCConfig.signal_mult)")
         print(f"  Trade signal  : {sr['trade_signal'].upper()}")
     else:
         print("  No signal table entry for Warsh (too recent / OOS)")
 
     if not pred_row.empty:
-        print(f"\n  Per-tenor gap_hat:")
-        print(f"  {'Tenor':6s}  {'gap_hat':>10s}  {'gap_actual':>12s}  {'z':>6s}")
-        print(f"  {'─'*42}")
-        for _, r in pred_row.iterrows():
-            act_str = f"{r['gap_actual']:>+10.6f}" if pd.notna(r.get("gap_actual")) else "        N/A"
-            print(f"  {r['tenor']:6s}  {r['gap_hat']:>+10.6f}  {act_str}  "
+        print(f"\n  Per-tenor gap_hat  [gap_yc_bps² = iv² − rv² in bps-yield space]:")
+        print(f"  {'Tenor':4s}  {'gap_hat(bps²)':>14s}  {'gap_act(bps²)':>14s}  {'iv_bps':>8s}  {'rv_bps':>8s}  {'z':>6s}")
+        print(f"  {'─'*60}")
+        for _, r in pred_row.sort_values("tenor").iterrows():
+            act_str = f"{r['gap_actual']:>+14.1f}" if pd.notna(r.get("gap_actual")) else f"{'N/A':>14s}"
+            # Show per-tenor IV/RV from vrp_panel if available
+            vrow = vrp_panel_row[vrp_panel_row["tenor"] == r["tenor"]]
+            iv_s = f"{float(vrow['iv_event_bps'].iloc[0]):>8.1f}" if not vrow.empty and "iv_event_bps" in vrow else f"{'':>8s}"
+            rv_s = f"{float(vrow['rv_event_yc'].iloc[0]):>8.1f}" if not vrow.empty else f"{'':>8s}"
+            print(f"  {r['tenor']:4s}  {r['gap_hat']:>+14.1f}  {act_str}  "
+                  f"{iv_s}  {rv_s}  "
                   f"{r['gap_hat']/max(r['sigma_f'],1e-8):>+6.2f}")
 
     if not rv_row.empty:
-        print(f"\n  Realized vol on FOMC day:")
-        for _, r in rv_row.iterrows():
-            gk_str = f"{r['rv_event_gk']:.2f}pp GK" if pd.notna(r['rv_event_gk']) else "(no OHLC)"
-            print(f"  {r['tenor']:4s}  {gk_str}  |  "
-                  f"{r.get('rv_event_yc', np.nan):.1f}bps yc-σ  "
-                  f"[{r['estimator_type']}]")
+        print(f"\n  Realized vol on Warsh FOMC day:")
+        print(f"  {'Tenor':4s}  {'GK price-vol':>14s}  {'Yield-RV (bps)':>16s}  {'Estimator':>12s}")
+        print(f"  {'─'*52}")
+        for _, r in rv_row.sort_values("tenor").iterrows():
+            gk_s = f"{r['rv_event_gk']:.2f}pp" if pd.notna(r.get("rv_event_gk")) else "—"
+            yc_s = f"{r['rv_event_yc']:.1f} bps" if pd.notna(r.get("rv_event_yc")) else "—"
+            print(f"  {r['tenor']:4s}  {gk_s:>14s}  {yc_s:>16s}  {r.get('estimator_type',''):>12s}")
 
     print(f"\n  ⚠  Warsh is 1 OOS meeting. VRP signal is illustrative, not validated.")
-    print("═" * 62)
+    print("═" * 66)
 
 
-warsh_vrp_readout(signal_table, gap_preds, realized_curve)
+warsh_vrp_readout(signal_table, gap_preds, realized_curve, vrp_panel)
 
 # %% [markdown]
 # ---
@@ -2280,8 +2362,8 @@ print(f"  IV coverage: {_iv_coverage}")
 print(f"\n  CAVEATS:")
 print(f"  1. Statistical, not riskless arbitrage. Small n (~84 meetings with real IV).")
 print(f"  2. LLM hindsight risk mitigated: linguistic-only rubric, lexicon validation.")
-print(f"  3. Cash-tenor (7Y, 20Y) excluded from VRP gap — yield-change RV (bps) vs")
-print(f"     VXTYN-derived IV (% price vol) are different units; cannot subtract.")
+print(f"  3. 7Y/20Y (cash-only) included via yield-vol gap (gap_yc_bps2). Price-vol gap")
+print(f"     (gap_var) is NaN for these — RV in bps vs IV in % price vol are incompatible.")
 print(f"  4. GK/Parkinson estimators understate jump vol — conservative bias on RV.")
 print(f"  5. Post-2020 gap: VXTYN discontinued; CBOE CDN blocked. Bloomberg IV needed"
       f" for 2020–present meetings. Use implied_curve.csv seam when available.")
