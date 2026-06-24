@@ -449,130 +449,218 @@ print(realized_curve.groupby("tenor")[["rv_event_gk","rv_event_yc"]].agg(
 # # Optional: iv_event_var, sigma_span, sigma_pre, T_span, T_pre
 # ```
 
-# %% ── 2a. TYVIX fetch + yield-vol scaling ────────────────────────────────────
-# CBOE TYVIX = expected vol of TY futures options, derived from Black-76 model
-# applied to the full options chain. Available free from CBOE public data portal.
+# %% ── 2a. VXTYN / TYVIX fetch + yield-vol scaling ───────────────────────────
+# VXTYN (FRED series VXTYN) = CBOE 10Y Treasury Note Volatility Index.
+# Constructed by CBOE from Black-76 model applied to the ZN (TY) options chain.
+# Units: annualised % PRICE volatility of ZN futures  (same units as GK on ZN=F OHLC).
+# Coverage: FRED has 2003-01-02 – 2020-05-15 (series discontinued by CBOE).
+# Post-2020 only: CBOE CDN endpoints (currently returning 403).
+#
+# Unit note: VXTYN and GK are BOTH in % price-vol of ZN futures.
+#   VRP gap (pp) = VXTYN_pre_event - GK_event_day  (positive = IV > RV)
+#   To convert to yield-vol: yield_bps ≈ price_pct × futures_price / mod_duration
+#   For ZN~110, dur~7: 1% price vol ≈ 15.7 bps yield vol. Conversion is tenor-specific.
+#
+# Yield-change RV (7Y, 20Y cash-only) is in bps — a DIFFERENT unit.
+# These tenors cannot feed the same VRP gap column; they are reported separately.
 
-_TYVIX_URLS = [
+_TYVIX_CACHE = VRP_CACHE_DIR / "tyvix_history.parquet"
+_CBOE_URLS   = [
     "https://cdn.cboe.com/api/global/us_indices/daily_prices/VXTYN_History.csv",
     "https://cdn.cboe.com/api/global/us_indices/daily_prices/TYVIX_History.csv",
 ]
-_TYVIX_CACHE = VRP_CACHE_DIR / "tyvix_history.parquet"
 
 
 def fetch_tyvix() -> pd.DataFrame:
     """
-    Fetch CBOE TYVIX — the 10Y Treasury Note Implied Volatility Index.
-    CBOE derives this from Black-76 applied to the full ZN (TY) options chain.
-    Returns DataFrame with single column 'TYVIX' (annualised %, 30-day horizon).
+    Fetch VXTYN / TYVIX from three sources in priority order:
+      1. Disk cache (parquet) — avoids re-fetching
+      2. FRED REST API (series VXTYN) — reliable, covers 2003-01-02 to 2020-05-15
+      3. CBOE CDN URLs — covers post-2020 data but currently returning 403
+
+    Returns DataFrame with column 'TYVIX' indexed by date.
+    Units: annualised % price volatility of 10Y T-note futures (ZN=F).
     """
+    # ── 1. cache ──────────────────────────────────────────────────────────────
     if _TYVIX_CACHE.exists():
         df = pd.read_parquet(_TYVIX_CACHE)
-        print(f"  TYVIX: {len(df)} obs from cache  "
+        print(f"  VXTYN: {len(df)} obs from cache  "
               f"({df.index[0].date()} – {df.index[-1].date()})")
         return df
 
-    for url in _TYVIX_URLS:
+    combined = pd.DataFrame()
+
+    # ── 2. FRED VXTYN (2003-01-02 – 2020-05-15) ──────────────────────────────
+    try:
+        url  = (f"https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id=VXTYN&api_key={FRED_API_KEY}"
+                f"&observation_start={START_DATE}&file_type=json")
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        obs  = resp.json().get("observations", [])
+        idx  = [pd.Timestamp(o["date"]) for o in obs if o["value"] not in (".", "")]
+        vals = [float(o["value"]) for o in obs if o["value"] not in (".", "")]
+        if len(vals) > 50:
+            fred_df = pd.DataFrame({"TYVIX": vals}, index=idx)
+            combined = fred_df
+            print(f"  VXTYN (FRED):  {len(fred_df)} obs  "
+                  f"({fred_df.index[0].date()} – {fred_df.index[-1].date()})")
+    except Exception as e:
+        print(f"  VXTYN FRED fetch failed: {e}")
+
+    # ── 3. CBOE CDN (post-2020 data if endpoint becomes available again) ──────
+    last_fred_date = combined.index[-1] if not combined.empty else pd.Timestamp("2000-01-01")
+    for url in _CBOE_URLS:
         try:
-            raw = requests.get(url, timeout=20)
+            raw   = requests.get(url, timeout=20)
             raw.raise_for_status()
-            # CBOE CSV: first few rows are header metadata; find the data start
             text  = raw.text
             lines = text.splitlines()
-            # Find the first line that starts with a date-like pattern (YYYY-MM-DD or MM/DD/YYYY)
-            data_start = 0
-            for i, line in enumerate(lines):
-                if re.match(r"^\d{4}-\d{2}-\d{2}|^\d{1,2}/\d{1,2}/\d{4}", line.strip()):
-                    data_start = i
-                    break
+            data_start = next(
+                (i for i, line in enumerate(lines)
+                 if re.match(r"^\d{4}-\d{2}-\d{2}|^\d{1,2}/\d{1,2}/\d{4}", line.strip())),
+                0
+            )
             from io import StringIO
-            df = pd.read_csv(
+            cboe_df = pd.read_csv(
                 StringIO("\n".join(lines[data_start:])),
                 header=None, names=["date","TYVIX"],
                 parse_dates=["date"], index_col="date",
             )
-            df = df[["TYVIX"]].dropna().sort_index()
-            df["TYVIX"] = pd.to_numeric(df["TYVIX"], errors="coerce")
-            df = df.dropna()
-            if len(df) > 100:
-                df.to_parquet(_TYVIX_CACHE)
-                print(f"  TYVIX: {len(df)} obs fetched from CBOE  "
-                      f"({df.index[0].date()} – {df.index[-1].date()})")
-                return df
+            cboe_df = cboe_df[["TYVIX"]].copy()
+            cboe_df["TYVIX"] = pd.to_numeric(cboe_df["TYVIX"], errors="coerce")
+            cboe_df = cboe_df.dropna()
+            # Only keep rows newer than what FRED already covers
+            cboe_new = cboe_df[cboe_df.index > last_fred_date]
+            if len(cboe_new) > 5:
+                combined = pd.concat([combined, cboe_new]).sort_index()
+                print(f"  VXTYN (CBOE):  {len(cboe_new)} obs post-{last_fred_date.date()}")
+            break
         except Exception as e:
-            print(f"  TYVIX URL {url}: {e}")
+            print(f"  VXTYN CBOE ({url.split('/')[-1]}): {e}")
 
-    print("  TYVIX unavailable — using GK-proxy fallback for implied vol.")
+    if not combined.empty and len(combined) > 50:
+        combined = combined.sort_index()
+        combined.to_parquet(_TYVIX_CACHE)
+        return combined
+
+    print("  VXTYN unavailable from all sources — using GK-proxy fallback for implied vol.")
+    print("  NOTE: FRED VXTYN ends 2020-05-15; post-2020 IV requires Bloomberg or CME DataMine.")
     return pd.DataFrame()
 
 
-def _compute_yield_vol_ratios(fred_yields: dict) -> dict:
+def _compute_price_vol_ratios(ohlc_data: dict) -> dict:
     """
-    Compute per-tenor annualised yield-change std relative to 10Y.
-    Used to scale TYVIX (10Y-based) to other tenors.
+    Compute per-tenor empirical price-vol ratio relative to 10Y ZN futures.
+
+    Uses GK estimator on the full OHLC history for each futures-traded tenor.
+    This correctly accounts for duration differences across contracts:
+      ZT (2Y): ~0.23×   ZF (5Y): ~0.61×   ZN (10Y): 1.00×   ZB (30Y): ~1.90×
+
+    Yield-vol ratios (bps/bps, ≈ 0.86–1.04 across tenors) are NOT correct here:
+    they ignore duration and produce wrong IV scaling for 2Y, 5Y, 30Y vs 10Y.
+
+    Cash-only tenors (7Y, 20Y) have no OHLC; their price-vol ratios are linearly
+    interpolated from the adjacent futures tenors.
     """
-    stds = {}
-    for tenor, s in fred_yields.items():
-        chg = s.diff().dropna() * 100   # daily changes in bps
-        stds[tenor] = float(chg.std() * sqrt(TRADING_DAYS))
-    base = stds.get("10Y", 1.0) or 1.0
-    return {t: v / base for t, v in stds.items()}
+    gk_vols: dict[str, float] = {}
+    for tenor, cfg in TENORS.items():
+        if cfg.get("cash_only"):
+            continue
+        df = ohlc_data.get(tenor)
+        if df is None or len(df) < 30:
+            continue
+        daily_var = pd.Series(
+            [garman_klass_var(r["Open"], r["High"], r["Low"], r["Close"])
+             for _, r in df.iterrows()],
+            index=df.index,
+        ).clip(lower=0)
+        gk_vols[tenor] = float(daily_var.mean() ** 0.5 * TRADING_DAYS ** 0.5 * 100)
+
+    base = gk_vols.get("10Y", 1.0) or 1.0
+    ratios: dict[str, float] = {t: v / base for t, v in gk_vols.items()}
+
+    # Cash-only tenors: linear interpolation between adjacent futures tenors
+    tenor_years = {"2Y": 2, "5Y": 5, "7Y": 7, "10Y": 10, "20Y": 20, "30Y": 30}
+    futures_years = {t: tenor_years[t] for t in ratios}
+    for cash in ("7Y", "20Y"):
+        yr = tenor_years[cash]
+        below = max((y for y in futures_years.values() if y < yr), default=None)
+        above = min((y for y in futures_years.values() if y > yr), default=None)
+        if below and above:
+            t_lo = [t for t, y in tenor_years.items() if y == below and t in ratios][0]
+            t_hi = [t for t, y in tenor_years.items() if y == above and t in ratios][0]
+            frac = (yr - below) / (above - below)
+            ratios[cash] = ratios[t_lo] + frac * (ratios[t_hi] - ratios[t_lo])
+        elif below:
+            ratios[cash] = ratios[[t for t, y in tenor_years.items() if y == below][0]]
+        elif above:
+            ratios[cash] = ratios[[t for t, y in tenor_years.items() if y == above][0]]
+
+    return ratios
 
 
 def _build_implied_from_tyvix(tyvix_df: pd.DataFrame,
-                                yield_vol_ratios: dict) -> pd.DataFrame:
+                                price_vol_ratios: dict) -> pd.DataFrame:
     """
-    Build the full implied curve from TYVIX using:
-      1. Black-76 event-variance stripping:
-         iv_event_var = (TYVIX_{t-1}² - TYVIX_{t+1}²) × T_30day
-         where T_30day = 30/252 (TYVIX is a constant 30-day horizon index)
-      2. Scale 10Y event vol to other tenors via yield-vol ratios.
-    If stripping yields negative variance (rare), fall back to TYVIX_{t-1}.
+    Build implied event vol curve from VXTYN (FRED) using Black-76 variance stripping.
+
+    Method:
+      1. VXTYN is the 30-day constant-horizon implied price-vol of ZN (10Y) futures, in %.
+      2. Event-variance stripping isolates the FOMC jump from the 30-day total:
+           var_jump = (VXTYN_pre² − VXTYN_post²) × (30/252)     [units: %²]
+           iv_10y   = sqrt(var_jump × 252)                        [annualised %, same as GK]
+         Both VXTYN and GK are annualised % PRICE volatility → directly comparable.
+      3. Scale 10Y event vol to other tenors using empirical GK price-vol ratios
+         (NOT yield-vol ratios; those ignore duration and give wrong scaling).
+
+    Data coverage: VXTYN available on FRED through 2020-05-15.
+    Post-2020 meetings have no free IV source → excluded (NaN) here; pipeline falls
+    back to proxy for those rows in load_implied_curve().
     """
     T30 = 30.0 / TRADING_DAYS
     rows = []
     for fd in fomc_dates_list:
         ts  = pd.Timestamp(fd)
         idx = tyvix_df.index.searchsorted(ts)
-        if idx < 2 or idx >= len(tyvix_df) - 2:
+        if idx < 1 or idx >= len(tyvix_df) - 1:
             continue
 
-        tv_pre  = float(tyvix_df.iloc[idx - 1]["TYVIX"])   # 1 bd before
-        tv_post = float(tyvix_df.iloc[idx + 1]["TYVIX"])   # 1 bd after
+        tv_pre  = float(tyvix_df.iloc[idx - 1]["TYVIX"])   # 1 bd before FOMC
+        tv_post = float(tyvix_df.iloc[idx + 1]["TYVIX"])   # 1 bd after FOMC
 
-        # Black-76 event-variance stripping (constant-horizon method)
-        # var_pre includes the FOMC jump; var_post excludes it
-        var_stripped = (tv_pre ** 2 - tv_post ** 2) * T30  # total annualised variance
+        # Variance stripping: total 30-day variance = σ² × T30 (both in %²)
+        var_stripped = (tv_pre ** 2 - tv_post ** 2) * T30
         if var_stripped > 0:
-            # Annualise from total variance to per-day → per-year
-            iv_10y = float(sqrt(var_stripped * TRADING_DAYS))   # pp annualised
+            iv_10y = float(sqrt(var_stripped * TRADING_DAYS))   # annualised %, same frame as GK
         else:
-            iv_10y = tv_pre   # fall back to pre-event TYVIX if stripping is negative
+            iv_10y = tv_pre   # negative strip (rare) → fall back to pre-event VXTYN level
 
         past_tyvix = tyvix_df[tyvix_df.index < ts]["TYVIX"]
         pctile = float((past_tyvix < tv_pre).mean() * 100) if len(past_tyvix) > 10 else 50.0
 
         for tenor in TENORS:
-            scale = yield_vol_ratios.get(tenor, 1.0)
+            scale = price_vol_ratios.get(tenor, 1.0)
             rows.append({
-                "meeting_date": ts,
-                "tenor":        tenor,
-                "iv_event_vol": iv_10y * scale,   # pp ann., tenor-adjusted
+                "meeting_date":  ts,
+                "tenor":         tenor,
+                "iv_event_vol":  iv_10y * scale,   # annualised % price vol, tenor-scaled
                 "iv_percentile": pctile,
-                "tyvix_pre":    tv_pre,
-                "tyvix_post":   tv_post,
-                "tenor_scale":  scale,
-                "iv_stripped":  var_stripped > 0,
+                "tyvix_pre":     tv_pre,
+                "tyvix_post":    tv_post,
+                "tenor_scale":   scale,
+                "iv_stripped":   var_stripped > 0,
+                "vxtyn_covered": True,             # flag: FRED VXTYN data exists
             })
     df = pd.DataFrame(rows)
     df["meeting_date"] = pd.to_datetime(df["meeting_date"])
     return df
 
 
-# ── Compute yield-vol scaling factors ─────────────────────────────────────────
-_yield_vol_ratios = _compute_yield_vol_ratios(fred_yields)
-print(f"\nYield-vol ratios (vs 10Y): "
-      + "  ".join(f"{t}={v:.2f}" for t, v in sorted(_yield_vol_ratios.items())))
+# ── Compute price-vol scaling factors (from OHLC, must be after ohlc_data) ───
+_price_vol_ratios = _compute_price_vol_ratios(ohlc_data)
+print(f"\nPrice-vol ratios (vs 10Y ZN): "
+      + "  ".join(f"{t}={v:.3f}" for t, v in sorted(_price_vol_ratios.items())))
 
 # ── Try TYVIX ─────────────────────────────────────────────────────────────────
 _tyvix_df = fetch_tyvix()
@@ -612,12 +700,17 @@ def load_implied_curve(csv_path: Path = IMPLIED_CSV) -> tuple[pd.DataFrame, str]
         print(f"[implied] loaded from CSV: {df.shape}")
         return df, "csv"
 
-    # ── 4. CBOE TYVIX + Black-76 variance stripping ───────────────────────────
+    # ── 4. FRED VXTYN + Black-76 variance stripping ──────────────────────────
     if not _tyvix_df.empty:
-        df = _build_implied_from_tyvix(_tyvix_df, _yield_vol_ratios)
-        n_stripped = df.get("iv_stripped", pd.Series([False])).sum()
-        print(f"[implied] TYVIX + Black-76 variance stripping: "
-              f"{len(df)} rows  {n_stripped} meetings with positive stripped variance")
+        df = _build_implied_from_tyvix(_tyvix_df, _price_vol_ratios)
+        n_stripped = int(df.get("iv_stripped", pd.Series(dtype=bool)).sum())
+        n_meetings = df["meeting_date"].nunique()
+        print(f"[implied] FRED VXTYN + Black-76 variance stripping: "
+              f"{n_meetings} meetings  {n_stripped} with positive stripped variance")
+        print(f"         IV scale: 2Y={_price_vol_ratios.get('2Y',1):.3f}×  "
+              f"5Y={_price_vol_ratios.get('5Y',1):.3f}×  "
+              f"10Y=1.000×  "
+              f"30Y={_price_vol_ratios.get('30Y',1):.3f}×  (price-vol ratios)")
         return df, "tyvix_black76"
 
     # ── 5. PROXY fallback (gap ≈ 0 by construction — Bloomberg required) ──────
@@ -641,13 +734,21 @@ implied_curve, _iv_source = load_implied_curve()
 
 def compute_vrp_gap(realized: pd.DataFrame, implied: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge realized + implied curves; compute VRP gap in variance space.
+    Merge realized and implied curves; compute VRP gap in variance space.
 
-    gap_var  = rv_event_var - iv_event_var  (pp^2; > 0 => straddle underpriced)
-    rv_event_var = (rv_event_gk / 100)^2  (annualised variance, unitless)
-    iv_event_var = (iv_event_vol / 100)^2
+    Unit consistency rule (critical):
+      Futures tenors (2Y, 5Y, 10Y, 30Y):
+        rv_event_gk  = GK on OHLC of the futures contract  [annualised % PRICE vol]
+        iv_event_vol = VXTYN stripped via Black-76          [annualised % PRICE vol]
+        gap_var      = (iv/100)² − (rv/100)²               [valid, same units]
 
-    For cash-only tenors: rv is in bps; noted as different estimator.
+      Cash-only tenors (7Y, 20Y):
+        rv_event_yc  = |Δyield| × sqrt(252)                [annualised bps YIELD vol]
+        iv_event_vol = VXTYN × price_vol_ratio (interpolated) [annualised % PRICE vol]
+        gap_var      = NaN  ← CANNOT subtract bps from % price vol
+
+      gap_var > 0 → IV > RV → straddle was over-priced → short-vol trade profitable
+      gap_var < 0 → IV < RV → straddle was under-priced → rare; may signal stress
     """
     rv_sel = realized[["meeting_date","tenor","rv_event_gk","rv_event_yc",
                          "rv_event_park","cash_only_flag","estimator_type"]].copy()
@@ -655,23 +756,32 @@ def compute_vrp_gap(realized: pd.DataFrame, implied: pd.DataFrame) -> pd.DataFra
 
     panel = rv_sel.merge(impl, on=["meeting_date","tenor"], how="left")
 
-    # Use GK for futures tenors, yc for cash-only tenors
-    panel["rv_primary"] = np.where(
+    # For futures tenors only: both IV and RV in % price vol → gap is meaningful
+    panel["rv_event_var"] = np.where(
         panel["cash_only_flag"],
-        panel["rv_event_yc"],
-        panel["rv_event_gk"],
+        np.nan,                                  # cash-only: unit mismatch → NaN
+        (panel["rv_event_gk"] / 100) ** 2,
     )
-    panel["rv_event_var"] = (panel["rv_primary"] / 100) ** 2
-    panel["iv_event_var"] = (panel["iv_event_vol"] / 100) ** 2
-    panel["gap_var"]      = panel["rv_event_var"] - panel["iv_event_var"]
+    panel["iv_event_var"] = np.where(
+        panel["cash_only_flag"],
+        np.nan,
+        (panel["iv_event_vol"] / 100) ** 2,
+    )
+    # gap_var sign convention: IV − RV (positive = vol was over-priced, sell-vol wins)
+    panel["gap_var"] = panel["iv_event_var"] - panel["rv_event_var"]
 
     print(f"\nVRP panel: {panel.shape}")
     print(f"  IV source: {_iv_source}")
+    print(f"  gap_var = IV_var − RV_var  (+ = IV > RV, sell-vol wins; cash tenors = NaN)")
     gp = panel.groupby("tenor")["gap_var"]
-    print(gp.agg(lambda x: f"mean={x.mean():.4f}  n={x.notna().sum()}").to_string())
+    for tenor, grp in gp:
+        valid = grp.dropna()
+        cash = TENORS[tenor].get("cash_only", False)
+        tag = " [cash-only, no gap]" if cash else f" mean={valid.mean():.4f}  IV>RV={( valid>0).mean()*100:.0f}%"
+        print(f"    {tenor}  n={valid.notna().sum()}{tag}")
     if _iv_source == "proxy":
         print("  ⚠  gap_var ≈ 0 in proxy mode (IV = smoothed RV). "
-              "Gap analysis requires Bloomberg IV.")
+              "Add FRED VXTYN cache or Bloomberg IV for true VRP.")
     return panel
 
 
@@ -1503,22 +1613,22 @@ def build_signal_table(gap_preds: pd.DataFrame,
                         kappa: float = KAPPA,
                         z_threshold: float = GAP_THRESHOLD_Z) -> pd.DataFrame:
     """
-    Per meeting, select the trade tenor (max gap_hat > 0) and compute:
+    Per meeting, select the trade tenor with largest predicted gap_hat and compute:
       z           = gap_hat / sigma_f
       signal_mult = 1 + kappa * max(0, z)
 
+    Sign convention: gap_var = IV_var − RV_var
+      gap_hat > 0  → IV > RV expected → sell-vol signal (straddle was over-priced)
+      gap_hat ≤ 0  → RV > IV expected → no sell-vol edge; flat / reduce size
+
     The signal table is the handoff to fomc_straddle_mc.py:
       MCConfig.signal_mult = row["signal_mult"]  (where row = the next forecast)
+      A sell-vol strategy uses signal_mult > 1 to scale up the short straddle.
     """
     rows = []
     for date, grp in gap_preds.groupby("meeting_date"):
-        # Filter to positive gap_hat (straddle underpriced)
-        pos = grp[grp["gap_hat"] > 0].copy()
-        if pos.empty:
-            # No positive signal — choose minimum negative gap (least overpriced)
-            chosen = grp.loc[grp["gap_hat"].idxmax()]
-        else:
-            chosen = pos.loc[pos["gap_hat"].idxmax()]
+        # Pick tenor with highest gap_hat (most IV-over-RV; largest sell-vol edge)
+        chosen = grp.loc[grp["gap_hat"].idxmax()]
 
         z    = float(chosen["gap_hat"]) / max(float(chosen["sigma_f"]), 1e-8)
         mult = 1.0 + kappa * max(0.0, z)
@@ -1531,7 +1641,7 @@ def build_signal_table(gap_preds: pd.DataFrame,
             "sigma_f":       float(chosen["sigma_f"]),
             "z":             z,
             "signal_mult":   mult,
-            "trade_signal":  "long" if z > z_threshold else "flat",
+            "trade_signal":  "sell_vol" if z > z_threshold else "flat",
         })
 
     df = pd.DataFrame(rows).sort_values("meeting_date").reset_index(drop=True)
@@ -1562,8 +1672,10 @@ print(signal_table.tail(5).to_string(index=False))
 
 def eval_sign_hit_rate(gap_preds: pd.DataFrame) -> pd.DataFrame:
     """
-    Did we correctly predict whether the gap was positive (straddle underpriced)?
+    Did we correctly predict the sign of gap_var (IV_var − RV_var)?
+    gap > 0 → IV > RV → straddle was over-priced → sell-vol trade profitable.
     Report hit rate per tenor and pooled, with Wilson CI.
+    Naive benchmark: IV > RV ~73-87% of FOMC days → compare model hit rate to that.
     """
     valid = gap_preds.dropna(subset=["gap_hat","gap_actual"])
 
@@ -1619,8 +1731,9 @@ def eval_pnl_simulation(signal_table: pd.DataFrame,
       3. Never trade — flat (benchmark)
       4. Naive IV    — long vol when iv_percentile < 40th pctile (mean reversion)
 
-    P&L proxy: +1 when gap_actual > 0 (straddle underpriced → we win),
-               −1 when gap_actual < 0 (straddle overpriced → we lose).
+    P&L proxy (sell-vol strategy): +1 when gap_actual > 0 (IV > RV → option premium
+               collected > realized move → sell-vol wins),
+               −1 when gap_actual < 0 (RV > IV → realized move > premium → we lose).
     NLP model must beat naive IV model or text adds nothing.
     """
     sig = signal_table[["meeting_date","trade_tenor","z","signal_mult","trade_signal"]].copy()
@@ -2159,11 +2272,17 @@ print(f"    Cols: word, doc_freq, decision, reason, warm_score, teal_score, vol_
 print(f"\n  fig_wc_a_small_multiples.png   (headline 2×2 grid)")
 print(f"  fig_wc_b_powell_warsh.png      (Powell vs Warsh comparison)")
 print(f"  fig_wc_c_bucket_mix.png        (quantitative bucket-mix anchor)")
-print(f"\n  IV source: {_iv_source}  (replace with Bloomberg for true VRP)")
+print(f"\n  IV source: {_iv_source}")
+_iv_coverage = "FRED VXTYN 2010–2020 (84 meetings); CBOE CDN blocked post-2020" \
+    if _iv_source == "tyvix_black76" else \
+    "proxy (rolling GK mean, gap≈0 by construction — add FRED VXTYN cache)"
+print(f"  IV coverage: {_iv_coverage}")
 print(f"\n  CAVEATS:")
-print(f"  1. Statistical, not riskless arbitrage. Small n (~100 OOS meetings).")
+print(f"  1. Statistical, not riskless arbitrage. Small n (~84 meetings with real IV).")
 print(f"  2. LLM hindsight risk mitigated: linguistic-only rubric, lexicon validation.")
-print(f"  3. Cash-tenor (7Y, 20Y) RV in bps — different estimator, note the basis.")
-print(f"  4. Range estimators (GK/Parkinson) understate jump vol — conservative bias.")
-print(f"  5. Proxy IV (no Bloomberg): gap ≈ 0 by construction. Bloomberg IV needed.")
+print(f"  3. Cash-tenor (7Y, 20Y) excluded from VRP gap — yield-change RV (bps) vs")
+print(f"     VXTYN-derived IV (% price vol) are different units; cannot subtract.")
+print(f"  4. GK/Parkinson estimators understate jump vol — conservative bias on RV.")
+print(f"  5. Post-2020 gap: VXTYN discontinued; CBOE CDN blocked. Bloomberg IV needed"
+      f" for 2020–present meetings. Use implied_curve.csv seam when available.")
 print("═" * 66)
