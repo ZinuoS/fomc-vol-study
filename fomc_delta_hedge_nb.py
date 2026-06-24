@@ -282,3 +282,200 @@ print(f"  Short 30Y tail (worst case per lot @ stop):  "
       f"${df_sim['total_pnl_30y'].min()*cfg.tick_value:+,.0f}")
 print(f"  Short 30Y tail at scale ({sizing['lots_30y']} lots):  "
       f"${df_sim['total_pnl_30y'].min()*cfg.tick_value*sizing['lots_30y']:+,.0f}")
+
+# %% [markdown]
+# ---
+# ## ETF Pipeline Signal Integration
+#
+# The ETF IV pipeline (`etf_gap_curve.parquet`) provides an independent
+# cross-check on the GapSpread signal using ETF realized vol (GK/Parkinson
+# estimator on SHY/TLT OHLC) vs ETF implied vol (VXTYN bridge 2010-2020,
+# MOVE bridge 2020-2026).
+#
+# This section:
+# 1. Loads the ETF gap curve for the latest FOMC meeting
+# 2. Cross-checks vs `gap_forecasts_spread.parquet`
+# 3. Derives yield-space event SDs suitable for `trade_ticket.py`
+# 4. Runs an ETF-pipeline-calibrated MC variant as a sensitivity check
+#
+# ### Key conversion: ETF price vol → yield bps/day
+#
+# ETF pipeline stores IV and RV as **annualized price-return vol** (%).
+# MOVE delivers an annualized yield vol (bps/year), so:
+#
+# ```
+# σ_yield_bps_yr = σ_price_vol_pct / duration_etf
+# σ_yield_bps_day = σ_yield_bps_yr / √252
+# ```
+#
+# where `duration_etf ∈ {1.9 (SHY), 4.5 (IEI), 7.5 (IEF), 11 (TLH), 16 (TLT)}`.
+#
+# For FOMC event sizing, `σ_yield_bps_day` is the RV/IV input to `trade_ticket.py`.
+
+# %% ── ETF pipeline: load & extract latest FOMC signal ────────────────────────
+
+import numpy as np
+from pathlib import Path
+
+ETF_GAP_PATH = Path("etf_gap_curve.parquet")
+ETF_DURATION = {"SHY": 1.9, "IEI": 4.5, "IEF": 7.5, "TLH": 11.0, "TLT": 16.0}
+
+etf_gap = pd.read_parquet(ETF_GAP_PATH)
+etf_gap["meeting_date"] = pd.to_datetime(etf_gap["meeting_date"])
+
+# Latest FOMC meeting with full SHY+TLT coverage
+latest_dt = etf_gap.loc[etf_gap["has_both"], "meeting_date"].max()
+latest = etf_gap[etf_gap["meeting_date"] == latest_dt].set_index("etf")
+
+shy  = latest.loc["SHY"] if "SHY" in latest.index else None
+tlt  = latest.loc["TLT"] if "TLT" in latest.index else None
+
+print(f"\n── ETF Pipeline: {latest_dt.date()} FOMC ──────────────────────────────────")
+print(f"  Source (SHY IV): {shy['source']}")
+print(f"  Source (TLT IV): {tlt['source']}")
+print(f"\n  {'Metric':<28} {'SHY (2Y)':>14} {'TLT (30Y)':>14}")
+print(f"  {'─'*28} {'─'*14} {'─'*14}")
+for label, col in [
+    ("RV event vol %",      "rv_vol_pct"),
+    ("IV event vol %",      "iv_event_vol_pct"),
+    ("IV percentile",       "iv_percentile"),
+    ("Gap (RV−IV var)",     "gap"),
+]:
+    sv = shy[col] if shy is not None else float("nan")
+    tv = tlt[col] if tlt is not None else float("nan")
+    fmt = f"{sv:>14.4f}" if not (isinstance(sv, str)) else f"{sv:>14}"
+    fmtb = f"{tv:>14.4f}" if not (isinstance(tv, str)) else f"{tv:>14}"
+    print(f"  {label:<28} {fmt} {fmtb}")
+
+gap_spread_etf  = latest["GapSpread_proxy"].iloc[0]
+spread_dir_etf  = latest["spread_direction"].iloc[0]
+print(f"\n  GapSpread_proxy (ETF): {gap_spread_etf:+.6f}  →  {spread_dir_etf}")
+print(f"  GapSpread (existing ):  {sig['z_spread']:+.3f} z-score  →  {sig['steepener_signal']}")
+
+# %% ── ETF-derived yield SDs for trade_ticket.py ──────────────────────────────
+
+def etf_vol_to_yield_bps_day(price_vol_pct: float, duration: float) -> float:
+    """
+    Convert ETF annualized price-return vol (%) → yield bps per event day.
+
+    σ_yield_pct_yr  = σ_price_pct / duration        (dur in years)
+    σ_yield_bps_yr  = σ_yield_pct_yr × 100          (% → bps)
+    σ_yield_bps_day = σ_yield_bps_yr / √252
+    """
+    return (price_vol_pct / duration) * 100 / np.sqrt(252)
+
+if shy is not None and tlt is not None:
+    # Use IV (forward-looking from MOVE bridge) as the pricing input
+    iv_2y_bps_day  = etf_vol_to_yield_bps_day(shy["iv_event_vol_pct"],  ETF_DURATION["SHY"])
+    iv_30y_bps_day = etf_vol_to_yield_bps_day(tlt["iv_event_vol_pct"],  ETF_DURATION["TLT"])
+    # Use RV (backward-looking) as the MC event-jump input
+    rv_2y_bps_day  = etf_vol_to_yield_bps_day(shy["rv_vol_pct"],  ETF_DURATION["SHY"])
+    rv_30y_bps_day = etf_vol_to_yield_bps_day(tlt["rv_vol_pct"],  ETF_DURATION["TLT"])
+
+    print(f"\n── ETF → Yield bps/day conversion ({latest_dt.date()}) ────────────────")
+    print(f"  {'Input':<32} {'SHY / 2Y':>12} {'TLT / 30Y':>12}")
+    print(f"  {'─'*32} {'─'*12} {'─'*12}")
+    print(f"  {'IV price vol % (annualised)':<32} {shy['iv_event_vol_pct']:>12.3f} {tlt['iv_event_vol_pct']:>12.3f}")
+    print(f"  {'RV price vol % (annualised)':<32} {shy['rv_vol_pct']:>12.3f} {tlt['rv_vol_pct']:>12.3f}")
+    print(f"  {'Duration (years)':<32} {ETF_DURATION['SHY']:>12.1f} {ETF_DURATION['TLT']:>12.1f}")
+    print(f"  {'IV → yield bps/day':<32} {iv_2y_bps_day:>12.3f} {iv_30y_bps_day:>12.3f}")
+    print(f"  {'RV → yield bps/day':<32} {rv_2y_bps_day:>12.3f} {rv_30y_bps_day:>12.3f}")
+    print()
+    print(f"  ── trade_ticket.py CFG overrides for {latest_dt.date()} ──")
+    print(f"  # Paste these into trade_ticket.CFG to use ETF pipeline signal:")
+    print(f"  SIGMA_2Y_YIELD_BPS_DAY  = {rv_2y_bps_day:.4f}  # RV from SHY GK estimator")
+    print(f"  SIGMA_30Y_YIELD_BPS_DAY = {rv_30y_bps_day:.4f}  # RV from TLT GK estimator")
+    print(f"  # For premium pricing (pass to SIGMA_N_*_OVERRIDE via sigma_price_from_event_sd):")
+    print(f"  # SIGMA_N_2Y_OVERRIDE  = sigma_price_from_event_sd({iv_2y_bps_day:.4f},  DV01_2Y_PER_1M)")
+    print(f"  # SIGMA_N_30Y_OVERRIDE = sigma_price_from_event_sd({iv_30y_bps_day:.4f}, DV01_30Y_PER_1M)")
+
+# %% ── ETF-calibrated MC sensitivity variant ───────────────────────────────────
+
+if shy is not None and tlt is not None:
+    # Convert ETF price vols → delta_hedge_sim event vol scale (fraction of forward)
+    # fomc_delta_hedge_sim uses sigma_iv_event in price-vol fraction (0.20 = 20%)
+    etf_sigma_iv_2y  = shy["iv_event_vol_pct"] / 100   # ETF price-return vol
+    etf_sigma_iv_30y = tlt["iv_event_vol_pct"] / 100
+    etf_sigma_rv_2y  = shy["rv_vol_pct"] / 100
+    etf_sigma_rv_30y = tlt["rv_vol_pct"] / 100
+
+    cfg_etf = copy.deepcopy(cfg)
+    cfg_etf.sigma_iv_event     = etf_sigma_iv_2y
+    cfg_etf.sigma_iv_event_30y = etf_sigma_iv_30y
+    cfg_etf.auto_calibrate = True
+    cfg_etf.__post_init__()
+
+    print(f"\n── ETF-calibrated MC variant ────────────────────────────────────────")
+    print(f"  sigma_iv_event (ETF / 2Y):  {etf_sigma_iv_2y*100:.2f}%  "
+          f"vs baseline {cfg.sigma_iv_event*100:.1f}%")
+    print(f"  sigma_iv_event (ETF / 30Y): {etf_sigma_iv_30y*100:.2f}%  "
+          f"vs baseline {cfg.sigma_iv_event_30y*100:.1f}%")
+    print(f"  RV / IV ratio (2Y):  {etf_sigma_rv_2y / etf_sigma_iv_2y:.3f}×  "
+          f"(>1 = 2Y realised > implied)")
+    print(f"  RV / IV ratio (30Y): {etf_sigma_rv_30y / etf_sigma_iv_30y:.3f}×  "
+          f"(<1 = 30Y realised < implied)")
+    print(f"\n  Running ETF-calibrated MC ({cfg.n_paths:,} paths) ...")
+
+    df_etf = run_mc(cfg_etf)
+    tv = cfg_etf.tick_value
+
+    print(f"\n  {'Scenario':<28} {'Mean P&L':>12} {'Win%':>8} {'VaR99':>12} {'Stop%':>8}")
+    print(f"  {'─'*28} {'─'*12} {'─'*8} {'─'*12} {'─'*8}")
+    for label, df_, tv_ in [
+        ("Baseline (gap_forecasts)",  df_sim,  cfg.tick_value),
+        (f"ETF pipeline ({latest_dt.date()})", df_etf, cfg_etf.tick_value),
+    ]:
+        mean_  = df_["total_pnl"].mean() * tv_
+        winr_  = (df_["total_pnl"] > 0).mean() * 100
+        var99_ = df_["total_pnl"].quantile(0.01) * tv_
+        stop_  = df_["stop_fired"].mean() * 100
+        print(f"  {label:<28} {mean_:>+12,.0f} {winr_:>8.1f}% {var99_:>+12,.0f} {stop_:>8.1f}%")
+
+    print(f"\n  GapSpread signal: {gap_spread_etf:+.6f} variance-units  "
+          f"→  {spread_dir_etf}")
+    print(f"  ETF-calibrated variant uses pipeline IV as event-vol input.")
+    print(f"  Use RV/IV ratios above to verify the front-end vol is mispriced.")
+
+# %% [markdown]
+# ## ETF pipeline integration notes
+#
+# ### Signal consistency check
+#
+# The `gap_forecasts_spread.parquet` z-score and the ETF `GapSpread_proxy` measure
+# the same signal through different data paths (direct Treasury yield vol for
+# gap_forecasts; ETF price vol via MOVE bridge for etf_gap_curve).  They should
+# agree on direction; magnitude will differ because:
+# - gap_forecasts uses bond yield vol directly; ETF uses price returns
+# - MOVE bridge covers 2020–2026 (ETF options chains not available post-TYVIX)
+#
+# ### How to feed ETF output into trade_ticket.py
+#
+# The printed `trade_ticket.CFG overrides` block above gives exact values
+# to paste into `CFG` in `trade_ticket.py`:
+#
+# ```python
+# # Realized vol from ETF pipeline → MC event-jump input
+# SIGMA_2Y_YIELD_BPS_DAY  = <rv_2y_bps_day>
+# SIGMA_30Y_YIELD_BPS_DAY = <rv_30y_bps_day>
+#
+# # OMON-implied vol → premium pricing (override from screen for best accuracy)
+# # If OMON is unavailable, use ETF-IV-derived sigma_n as proxy:
+# # SIGMA_N_2Y_OVERRIDE  = sigma_price_from_event_sd(iv_2y_bps_day,  DV01_2Y_PER_1M)
+# # SIGMA_N_30Y_OVERRIDE = sigma_price_from_event_sd(iv_30y_bps_day, DV01_30Y_PER_1M)
+# ```
+#
+# ### RV/IV interpretation
+#
+# | RV/IV (2Y) | RV/IV (30Y) | Interpretation |
+# |---|---|---|
+# | > 1 | < 1 | **Steepener signal**: front realized > implied, long end quiet |
+# | > 1 | > 1 | Parallel move — both legs expensive; reconsider sizing |
+# | < 1 | < 1 | Vol is richly priced everywhere; avoid straddles |
+# | < 1 | > 1 | Flattener signal (opposite trade) |
+#
+# ### ETF-calibrated vs baseline MC
+#
+# The ETF-calibrated variant uses pipeline IV (MOVE-derived) as the event vol
+# rather than the hand-tuned `sigma_iv_event` in the baseline config.  Use it to:
+# - Stress-test sensitivity to vol-level assumptions
+# - Verify that the steepener P&L is positive for a range of MOVE-implied vol levels
