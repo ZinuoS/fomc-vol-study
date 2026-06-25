@@ -78,8 +78,17 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+from matplotlib.lines import Line2D
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+plt.rcParams.update({
+    "figure.dpi": 130, "font.size": 10,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.alpha": 0.25,
+})
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 VRP_PANEL_PATH  = Path("vrp_cache/vrp_panel.parquet")
@@ -686,7 +695,7 @@ def walk_forward_spread(spread_df: pd.DataFrame,
             beta, beta_std, model = bayesian_ridge_augmented(
                 X_train, y_train, w, feat_names, prior
             )
-        except Exception as e:
+        except Exception:
             continue
 
         # Predict
@@ -939,6 +948,401 @@ def warsh_acceptance_test(preds: pd.DataFrame,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# VISUALISATIONS  (4 figures: timeline, hit rates, g-posterior, scatter)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_FIG_DIR = Path("spread_model_figs")
+_WARSH   = pd.Timestamp("2026-06-17")
+
+# Colour palette consistent with the rest of the repo
+_C = dict(pred="#2166ac", actual="#d6604d", ci="#a6c8e8",
+          pos="#1a7837", neg="#c0392b", flat="#888888",
+          hike="#fff3cd", warsh="#e8d5f5",
+          remove="#fce4ec", add_col="#e3f2fd",
+          g_post="#5e3a8c", g_ci="#c9b3e8", g_prior="#888888")
+
+# Communication-architecture regime colour map
+_REGIME_COLORS = {
+    "ADD_dots":      "#dbeafe",   # light blue
+    "ADD_threshold": "#bfdbfe",
+    "ADD_AIT":       "#93c5fd",
+    "REMOVE":        "#fce7f3",   # light pink / red
+    "PRE_FWD":       "#f3f4f6",
+    "POST_FWD":      "#e5e7eb",
+}
+
+
+def _shade_regimes(ax, preds: pd.DataFrame, _ymin: float = 0, _ymax: float = 0) -> list:
+    """Shade background by regime_label; return legend patches."""
+    if "regime_label" not in preds.columns or preds.empty:
+        return []
+    seen: dict[str, mpatches.Patch] = {}
+    sorted_p = preds.sort_values("meeting_date")
+    dates = sorted_p["meeting_date"].values
+    labels = sorted_p["regime_label"].values
+    for i, (d, lab) in enumerate(zip(dates, labels)):
+        col = _REGIME_COLORS.get(str(lab), "#f5f5f5")
+        x0  = d
+        x1  = dates[i + 1] if i + 1 < len(dates) else d + np.timedelta64(90, "D")
+        ax.axvspan(pd.Timestamp(x0), pd.Timestamp(x1),
+                   color=col, alpha=0.35, zorder=0, linewidth=0)
+        if lab not in seen:
+            seen[lab] = mpatches.Patch(color=col, alpha=0.55, label=str(lab))
+    return list(seen.values())
+
+
+def fig1_gapspread_timeline(preds: pd.DataFrame) -> None:
+    """
+    Fig 1 — Walk-forward OOS: predicted GapSpread + ±1σ CI vs actual.
+    Bottom panel: z-score bar chart (green = steepener, red = flattener, grey = flat).
+    """
+    _FIG_DIR.mkdir(exist_ok=True)
+    p = preds.sort_values("meeting_date").copy()
+    p["meeting_date"] = pd.to_datetime(p["meeting_date"])
+
+    has_actual = p["has_implied"] & p["gap_actual_spread"].notna()
+
+    fig = plt.figure(figsize=(15, 7.5))
+    gs_l = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[3, 1], hspace=0.10)
+    ax_top = fig.add_subplot(gs_l[0])
+    ax_bot = fig.add_subplot(gs_l[1], sharex=ax_top)
+
+    # ── regime shading ────────────────────────────────────────────────────────
+    ylo = p["predicted_gap_spread"].min() - p["std_gap_spread"].max()
+    yhi = p["predicted_gap_spread"].max() + p["std_gap_spread"].max()
+    regime_patches = _shade_regimes(ax_top, p, ylo, yhi)
+
+    # ── hiking-cycle highlight ────────────────────────────────────────────────
+    ax_top.axvspan(HIKNG_START, HIKING_END, color=_C["hike"], alpha=0.30,
+                   zorder=0, label="Hiking 2017-18")
+
+    # ── ±1σ CI band ──────────────────────────────────────────────────────────
+    ax_top.fill_between(p["meeting_date"],
+                        p["predicted_gap_spread"] - p["std_gap_spread"],
+                        p["predicted_gap_spread"] + p["std_gap_spread"],
+                        color=_C["ci"], alpha=0.55, label="±1σ forecast CI")
+
+    # ── predicted line ────────────────────────────────────────────────────────
+    ax_top.plot(p["meeting_date"], p["predicted_gap_spread"],
+                color=_C["pred"], lw=2.2, label="Predicted GapSpread (OOS)")
+
+    # ── actual dots (only where IV exists) ───────────────────────────────────
+    ax_top.scatter(p.loc[has_actual, "meeting_date"],
+                   p.loc[has_actual, "gap_actual_spread"],
+                   color=_C["actual"], s=38, zorder=5, label="Actual GapSpread (IV exists)")
+
+    # ── zero line ─────────────────────────────────────────────────────────────
+    ax_top.axhline(0, color="black", lw=0.9, ls="--")
+
+    # ── Warsh marker ─────────────────────────────────────────────────────────
+    ax_top.axvline(_WARSH, color="#7b2d8b", lw=2.0, ls=":", zorder=6)
+    ax_top.annotate("Warsh\n2026-06-17",
+                    xy=(_WARSH, ax_top.get_ylim()[1] if ax_top.get_ylim()[1] else yhi),
+                    xytext=(12, -30), textcoords="offset points",
+                    color="#7b2d8b", fontsize=8, fontweight="bold",
+                    arrowprops=dict(arrowstyle="->", color="#7b2d8b", lw=1.2))
+
+    ax_top.set_ylabel("GapSpread (pp²)\nGap(2Y) − Gap(30Y)", fontsize=10)
+    ax_top.set_title(
+        "Fig 1  |  GapSpread Walk-Forward OOS Predictions\n"
+        "GapSpread = rv_event_var(2Y) − iv_event_var(2Y)  −  [rv_event_var(30Y) − iv_event_var(30Y)]"
+        "     (+  = front underpriced = vol steepener)",
+        fontsize=10, fontweight="bold")
+
+    legend_lines = [
+        Line2D([0], [0], color=_C["pred"], lw=2.2),
+        mpatches.Patch(color=_C["ci"], alpha=0.55),
+        Line2D([0], [0], marker="o", color=_C["actual"], lw=0, markersize=6),
+        mpatches.Patch(color=_C["hike"], alpha=0.4),
+    ]
+    legend_labels = ["Predicted (OOS)", "±1σ CI", "Actual (IV)", "Hiking 2017-18"]
+    ax_top.legend(legend_lines + regime_patches,
+                  legend_labels + [p.get_label() for p in regime_patches],
+                  fontsize=8, loc="upper left", ncol=3)
+    plt.setp(ax_top.get_xticklabels(), visible=False)
+
+    # ── z-score bar chart (bottom panel) ─────────────────────────────────────
+    bar_colors = [
+        _C["pos"] if r["steepener_signal"] == "buy_front_sell_long"
+        else (_C["neg"] if r["steepener_signal"] == "sell_front_buy_long"
+              else _C["flat"])
+        for _, r in p.iterrows()
+    ]
+    ax_bot.bar(p["meeting_date"], p["z_spread"], color=bar_colors, width=20, alpha=0.75)
+    ax_bot.axhline(0, color="black", lw=0.8)
+    _zt = ModelConfig().z_threshold
+    ax_bot.axhline( _zt, color=_C["pos"], lw=1.0, ls="--", alpha=0.6)
+    ax_bot.axhline(-_zt, color=_C["neg"], lw=1.0, ls="--", alpha=0.6)
+    ax_bot.axvline(_WARSH, color="#7b2d8b", lw=2.0, ls=":", zorder=6)
+    ax_bot.set_ylabel("z-score", fontsize=9)
+    ax_bot.set_xlabel("Meeting Date")
+
+    bot_patches = [
+        mpatches.Patch(color=_C["pos"],  alpha=0.75, label="Steepener (long 2Y / short 30Y)"),
+        mpatches.Patch(color=_C["neg"],  alpha=0.75, label="Flattener (short 2Y / long 30Y)"),
+        mpatches.Patch(color=_C["flat"], alpha=0.75, label="Flat (below threshold)"),
+    ]
+    ax_bot.legend(handles=bot_patches, fontsize=8, loc="lower left")
+
+    fig.autofmt_xdate(rotation=30)
+    plt.savefig(_FIG_DIR / "fig1_gapspread_timeline.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[VIS] Fig 1 saved → {_FIG_DIR}/fig1_gapspread_timeline.png")
+
+
+def fig2_sign_hit_rates(bench_df: pd.DataFrame) -> None:
+    """
+    Fig 2 — Sign hit rate: model vs benchmarks, by subsample.
+    Bar chart + Wilson 90% CI error bars. 50% dashed line = coin flip.
+    """
+    _FIG_DIR.mkdir(exist_ok=True)
+    if bench_df.empty:
+        print("[VIS] Fig 2 skipped — no benchmark data.")
+        return
+
+    subsamples = bench_df["subsample"].unique()
+    n_sub = len(subsamples)
+    fig, axes = plt.subplots(1, n_sub, figsize=(6 * n_sub, 5.5), sharey=True)
+    if n_sub == 1:
+        axes = [axes]
+
+    strat_colors = {
+        "NLP model":          _C["pred"],
+        "Always-steepener":   _C["flat"],
+        "IV-pct baseline":    "#aaaaaa",
+    }
+    strat_order = ["NLP model", "Always-steepener", "IV-pct baseline"]
+
+    for ax, sub in zip(axes, subsamples):
+        sub_df = bench_df[bench_df["subsample"] == sub]
+        xs = np.arange(len(strat_order))
+        bars, errs_lo, errs_hi = [], [], []
+        for s in strat_order:
+            row = sub_df[sub_df["strategy"] == s]
+            if row.empty:
+                bars.append(0); errs_lo.append(0); errs_hi.append(0)
+            else:
+                hr = float(row["hit_rate"])
+                bars.append(hr)
+                errs_lo.append(hr - float(row["ci_lo"]))
+                errs_hi.append(float(row["ci_hi"]) - hr)
+
+        rects = ax.bar(xs, [v * 100 for v in bars],
+                       color=[strat_colors.get(s, "#aaa") for s in strat_order],
+                       width=0.5, alpha=0.80, edgecolor="white", zorder=3)
+
+        # Wilson CI error bars
+        ax.errorbar(xs, [v * 100 for v in bars],
+                    yerr=[[v * 100 for v in errs_lo], [v * 100 for v in errs_hi]],
+                    fmt="none", color="black", capsize=5, lw=1.5, zorder=4)
+
+        ax.axhline(50, color="black", lw=1.2, ls="--", label="50% coin flip")
+        ax.set_xticks(xs)
+        ax.set_xticklabels(strat_order, rotation=15, ha="right", fontsize=9)
+        ax.set_ylabel("Sign hit rate (%)" if ax == axes[0] else "")
+        ax.set_ylim(0, 100)
+
+        n_row = sub_df[sub_df["strategy"] == "NLP model"]
+        n_label = f"  n = {int(n_row['n'].iloc[0])}" if not n_row.empty else ""
+        ax.set_title(f"{sub}{n_label}", fontsize=11, fontweight="bold")
+
+        # Annotate bars
+        for rect, val, _lo, hi in zip(rects, bars, errs_lo, errs_hi):
+            ax.text(rect.get_x() + rect.get_width() / 2,
+                    rect.get_height() + hi * 100 + 1.5,
+                    f"{val*100:.0f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+        ax.legend(fontsize=8)
+
+    fig.suptitle(
+        "Fig 2  |  GapSpread Sign Hit Rate: Model vs Benchmarks\n"
+        "Error bars = Wilson 90% CI.  Primary validation: Hiking 2017-18 (closest to Warsh regime).",
+        fontsize=10, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(_FIG_DIR / "fig2_sign_hit_rates.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[VIS] Fig 2 saved → {_FIG_DIR}/fig2_sign_hit_rates.png")
+
+
+def fig3_g_posterior_evolution(preds: pd.DataFrame) -> None:
+    """
+    Fig 3 — g-posterior (Warsh mechanism coefficient f1 × RegimeTransition) over time.
+    Shows that one Warsh observation updates the prior rather than defining it.
+    """
+    _FIG_DIR.mkdir(exist_ok=True)
+    g = preds[["meeting_date", "g_posterior_mean",
+               "g_posterior_ci_lo", "g_posterior_ci_hi",
+               "ess", "regime_label"]].dropna(subset=["g_posterior_mean"]).copy()
+    g["meeting_date"] = pd.to_datetime(g["meeting_date"])
+
+    if g.empty:
+        print("[VIS] Fig 3 skipped — no g-posterior data.")
+        return
+
+    fig, (ax_g, ax_ess) = plt.subplots(2, 1, figsize=(13, 7),
+                                         gridspec_kw={"height_ratios": [2.5, 1]},
+                                         sharex=True)
+
+    prior_mean = MechanismPrior().feature_prior_means.get("f1_x_regime_transition", 0.4)
+
+    # ── g posterior ───────────────────────────────────────────────────────────
+    _shade_regimes(ax_g, preds, g["g_posterior_ci_lo"].min() - 0.05,
+                   g["g_posterior_ci_hi"].max() + 0.05)
+    ax_g.axvspan(HIKNG_START, HIKING_END, color=_C["hike"], alpha=0.25, zorder=0,
+                 label="Hiking 2017-18")
+    ax_g.fill_between(g["meeting_date"], g["g_posterior_ci_lo"], g["g_posterior_ci_hi"],
+                      color=_C["g_ci"], alpha=0.50, label="90% credible interval")
+    ax_g.plot(g["meeting_date"], g["g_posterior_mean"],
+              color=_C["g_post"], lw=2.2, label="g posterior mean")
+    ax_g.axhline(prior_mean, color=_C["g_prior"], lw=1.4, ls="--",
+                 label=f"Prior mean = {prior_mean:+.2f} (REMOVE → positive)")
+    ax_g.axhline(0, color="black", lw=0.8, ls=":")
+    ax_g.axvline(_WARSH, color="#7b2d8b", lw=2.0, ls=":", zorder=6)
+    ax_g.annotate("Warsh 2026", xy=(_WARSH, prior_mean),
+                  xytext=(12, 12), textcoords="offset points",
+                  color="#7b2d8b", fontsize=8, fontweight="bold",
+                  arrowprops=dict(arrowstyle="->", color="#7b2d8b", lw=1.2))
+
+    ax_g.set_ylabel("g coefficient\n(f1 × RegimeTransition)", fontsize=10)
+    ax_g.set_title(
+        "Fig 3  |  Warsh Mechanism Coefficient (g) Posterior Evolution\n"
+        "g > 0 = REMOVE-type regime → front-end underpriced (steepener signal). "
+        "One Warsh obs updates the prior, not defines it.",
+        fontsize=10, fontweight="bold")
+    ax_g.legend(fontsize=8, loc="lower right")
+    plt.setp(ax_g.get_xticklabels(), visible=False)
+
+    # ── ESS over time ─────────────────────────────────────────────────────────
+    ax_ess.fill_between(g["meeting_date"], 0, g["ess"],
+                        color=_C["pred"], alpha=0.45, step="mid")
+    ax_ess.step(g["meeting_date"], g["ess"], color=_C["pred"], lw=1.5, where="mid",
+                label="ESS (effective training obs)")
+    ax_ess.axvline(_WARSH, color="#7b2d8b", lw=2.0, ls=":", zorder=6)
+    ax_ess.set_ylabel("ESS", fontsize=9)
+    ax_ess.set_xlabel("Meeting Date")
+    ax_ess.legend(fontsize=8)
+
+    fig.autofmt_xdate(rotation=30)
+    plt.tight_layout()
+    plt.savefig(_FIG_DIR / "fig3_g_posterior.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[VIS] Fig 3 saved → {_FIG_DIR}/fig3_g_posterior.png")
+
+
+def fig4_predicted_vs_actual(preds: pd.DataFrame) -> None:
+    """
+    Fig 4 — Predicted vs actual GapSpread scatter (only meetings with matched IV).
+    Left: full OOS sample.  Right: hiking subsample (primary validation).
+    R² and sign hit rate annotated. Color = regime. Warsh marked if in sample.
+    """
+    _FIG_DIR.mkdir(exist_ok=True)
+
+    valid = preds.dropna(subset=["predicted_gap_spread", "gap_actual_spread"]).copy()
+    valid = valid[valid["has_implied"]].copy()
+    valid["meeting_date"] = pd.to_datetime(valid["meeting_date"])
+
+    if valid.empty:
+        print("[VIS] Fig 4 skipped — no meetings with matched IV for scatter.")
+        return
+
+    hiking = valid[(valid["meeting_date"] >= HIKNG_START) &
+                   (valid["meeting_date"] <= HIKING_END)]
+
+    def _r2(df: pd.DataFrame) -> float:
+        if len(df) < 2:
+            return float("nan")
+        ss_res = ((df["gap_actual_spread"] - df["predicted_gap_spread"]) ** 2).sum()
+        ss_tot = ((df["gap_actual_spread"] - df["gap_actual_spread"].mean()) ** 2).sum()
+        return float(1 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+
+    def _sign_hit(df: pd.DataFrame) -> float:
+        if df.empty:
+            return float("nan")
+        return float((np.sign(df["predicted_gap_spread"]) ==
+                      np.sign(df["gap_actual_spread"])).mean())
+
+    # Regime colour map for scatter
+    regime_cmap = {
+        "ADD_dots":      "#6baed6",
+        "ADD_threshold": "#3182bd",
+        "ADD_AIT":       "#08519c",
+        "REMOVE":        "#e31a1c",
+        "PRE_FWD":       "#969696",
+        "POST_FWD":      "#636363",
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+    for ax, (df, title) in zip(axes, [
+            (valid,  "Full OOS sample"),
+            (hiking, "Hiking 2017-18 (primary validation)")]):
+
+        if df.empty:
+            ax.set_visible(False)
+            continue
+
+        # Scatter by regime
+        for lab, grp in df.groupby("regime_label"):
+            ax.scatter(grp["predicted_gap_spread"], grp["gap_actual_spread"],
+                       color=regime_cmap.get(str(lab), "#aaa"),
+                       s=45, alpha=0.75, edgecolors="white", lw=0.5, zorder=3,
+                       label=str(lab))
+
+        # Warsh (if present — usually no IV so absent)
+        w_row = df[df["meeting_date"] == _WARSH]
+        if not w_row.empty:
+            ax.scatter(w_row["predicted_gap_spread"], w_row["gap_actual_spread"],
+                       color="#7b2d8b", s=120, marker="*", zorder=5, label="Warsh 2026")
+
+        # Perfect-prediction diagonal
+        all_vals = pd.concat([df["predicted_gap_spread"], df["gap_actual_spread"]])
+        lim = max(abs(all_vals.min()), abs(all_vals.max())) * 1.15
+        ax.plot([-lim, lim], [-lim, lim], color="#888", lw=1.2, ls="--", label="Perfect prediction")
+        ax.axhline(0, color="black", lw=0.6, ls=":")
+        ax.axvline(0, color="black", lw=0.6, ls=":")
+        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+
+        r2   = _r2(df)
+        hit  = _sign_hit(df)
+        n    = len(df)
+        ax.text(0.04, 0.96,
+                f"n = {n}\nR² = {r2:+.3f}\nSign hit = {hit*100:.0f}%",
+                transform=ax.transAxes, va="top", ha="left", fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+
+        # Quadrant labels (which quadrant = steepener correct / wrong)
+        ax.text( lim*0.55,  lim*0.85, "True\n+/+", color=_C["pos"], fontsize=8, alpha=0.6)
+        ax.text(-lim*0.95,  lim*0.85, "FN\n−/+", color=_C["neg"], fontsize=8, alpha=0.6)
+        ax.text( lim*0.55, -lim*0.95, "FP\n+/−", color=_C["neg"], fontsize=8, alpha=0.6)
+        ax.text(-lim*0.95, -lim*0.95, "True\n−/−", color=_C["pos"], fontsize=8, alpha=0.6)
+
+        ax.set_xlabel("Predicted GapSpread (pp²)", fontsize=10)
+        ax.set_ylabel("Actual GapSpread (pp²)" if ax == axes[0] else "")
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.legend(fontsize=7, loc="lower right", ncol=2)
+
+    fig.suptitle(
+        "Fig 4  |  Predicted vs Actual GapSpread  (meetings with matched IV only)\n"
+        "Gap(τ) = rv_event_var(τ) − iv_event_var(τ)   GapSpread = Gap(2Y) − Gap(30Y)",
+        fontsize=10, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(_FIG_DIR / "fig4_predicted_vs_actual.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[VIS] Fig 4 saved → {_FIG_DIR}/fig4_predicted_vs_actual.png")
+
+
+def visualise(preds: pd.DataFrame, bench_df: pd.DataFrame) -> None:
+    """Render all four GapSpread model output figures."""
+    _FIG_DIR.mkdir(exist_ok=True)
+    print(f"\n[VIS] Rendering figures → {_FIG_DIR}/")
+    fig1_gapspread_timeline(preds)
+    fig2_sign_hit_rates(bench_df)
+    fig3_g_posterior_evolution(preds)
+    fig4_predicted_vs_actual(preds)
+    print(f"[VIS] All figures saved.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # OUTPUT HANDOFF
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1050,6 +1454,9 @@ def run(cfg: ModelConfig | None = None) -> pd.DataFrame:
 
     # ── Warsh acceptance test ──────────────────────────────────────────────────
     warsh_acceptance_test(preds, spread_df, vrp_df)
+
+    # ── Visualisations ────────────────────────────────────────────────────────
+    visualise(preds, bench_df)
 
     # ── Caveats ────────────────────────────────────────────────────────────────
     print(f"\n[CAVEATS]")
