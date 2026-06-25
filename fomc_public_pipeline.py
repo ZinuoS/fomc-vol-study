@@ -652,43 +652,90 @@ stmt = compute_family_c(stmt)
 
 # %% ── FAMILY D — Disagreement ────────────────────────────────────────────────
 
-_DISAGREE_PATTERNS = [
-    r"\bsome\b .{0,30}\bparticipants?\b",
-    r"\bseveral\b .{0,30}\bparticipants?\b",
-    r"\ba few\b .{0,30}\bparticipants?\b",
-    r"\bmany\b .{0,30}\bparticipants?\b",
-    r"\bmost\b .{0,30}\bparticipants?\b",
-    r"\bdiverge",
-    r"\bdisagree",
-    r"\bdiffering\b",
-    r"\bcautioned\b",
-    r"\bpreferred\b .{0,30}(more|less|larger|smaller)",
+# ── Statement vote-record patterns (actual text in FOMC statements) ───────────
+# Previous patterns matched FOMC *minutes* language ("some participants") which
+# NEVER appears in real-time statements → always 0. Fixed to statement-appropriate
+# dissent signals (vote record + split-vote language).
+_DISAGREE_PATTERNS_STMT = [
+    r"\bvoting against\b",                           # explicit dissent vote
+    r"\bvoted against\b",
+    r"\bdissent(?:ed|ing)?\b",                       # "dissented", "dissenting"
+    r"\bopposed?\b.{0,60}(action|decision|measure)",
+    r"\bpreferred\b.{0,60}(lower|higher|larger|smaller|more|less)",  # preferred alternative
+    r"\bwho preferred\b",                            # "Bullard, who preferred..."
+    r"\bnot\b.{0,20}\bunanimous\b",
+    r"\bwith\b.{0,20}\bdissenting\b",               # "approved, with X dissenting"
+    r"\bvote was\b.{0,20}\d",                        # "the vote was 9-1"
+    # bare \d-\d removed: false-positives on rate-range notation "4-1/2 to 4-3/4"
+]
+
+# ── Presser dissent patterns (chair's spoken language about committee views) ──
+_DISAGREE_PATTERNS_PRESSER = [
+    r"\bdissent",
+    r"\brange of views\b",
+    r"\bsome of my colleagues\b",
+    r"\bsome\b.{0,40}\bcolleague",
+    r"\bdivided\b",
+    r"\bnot all\b.{0,30}(agree|share|support)",
+    r"\bnot unanimous\b",
+    r"\buncertain(ty)?\b.{0,40}\bcolleague",
+    r"\bdiffer(ent|ence|ing)?\b.{0,30}(view|opinion|assessment|projection)",
+    r"\bsome\b.{0,30}\b(see|think|believe|prefer|view)\b.{0,30}\bother",
+    r"\bnot everyone\b",
 ]
 
 
-def compute_family_d(stmt_df: pd.DataFrame) -> pd.DataFrame:
+def compute_family_d(stmt_df: pd.DataFrame,
+                     docs_raw_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Family D: Disagreement / heterogeneity.
 
-    On statements (not minutes), true cross-member dispersion is unobservable.
-    We use hedged-quantifier density as a proxy for the committee's internal
-    heterogeneity that the Chair felt obliged to surface publicly.
-    Returns disagree_density (hits/100 words); null where uninformative.
+    Two sources (combined, max-scaled):
 
-    NOTE: Minutes-based dispersion would be more powerful but requires separate
-    scraping. Leave a stub column `disagree_density_minutes` = null with a TODO.
+    Source 1 — Statement vote record (hits-per-100-words):
+      Patterns match the actual vote section in FOMC statements:
+      "voting against the action was [name]", "who preferred to lower...",
+      "9-1 vote". This is the primary signal — present for all 18 dissent meetings.
+
+    Source 2 — Presser chair acknowledgment (hits-per-100-words, weight 0.5):
+      Chair's spoken language acknowledging heterogeneity: "dissent",
+      "range of views", "some of my colleagues", "divided". Available only for
+      meetings with press conferences (presser_available=True).
+
+    Combined: disagree_density = stmt_score + 0.5 × presser_score
     """
     df = stmt_df.copy()
-    df["disagree_density"] = df["text"].apply(
-        lambda t: _regex_density(t, _DISAGREE_PATTERNS))
-    df["disagree_density_minutes"] = np.nan   # TODO: join minutes scrape
 
-    print("Family D — disagreement proxy:")
-    print(df[["meeting_date", "disagree_density"]].tail(6).to_string(index=False))
+    # Source 1: statement vote record
+    df["_dd_stmt"] = df["text"].apply(
+        lambda t: _regex_density(t, _DISAGREE_PATTERNS_STMT))
+
+    # Source 2: presser text_chair (when docs_raw_df provided)
+    df["_dd_presser"] = 0.0
+    if docs_raw_df is not None:
+        presser_col = "text_chair" if "text_chair" in docs_raw_df.columns else "text"
+        presser = (docs_raw_df[docs_raw_df["doc_type"] == "presser"]
+                   [["meeting_date", presser_col]]
+                   .rename(columns={presser_col: "_ptext"})
+                   .copy())
+        presser["meeting_date"] = pd.to_datetime(presser["meeting_date"])
+        presser["_dd_p"] = presser["_ptext"].apply(
+            lambda t: _regex_density(str(t), _DISAGREE_PATTERNS_PRESSER) if pd.notna(t) else 0.0)
+        df = df.merge(presser[["meeting_date", "_dd_p"]], on="meeting_date", how="left")
+        df["_dd_presser"] = df["_dd_p"].fillna(0.0)
+        df.drop(columns=["_dd_p"], inplace=True)
+
+    df["disagree_density"] = df["_dd_stmt"] + 0.5 * df["_dd_presser"]
+    df.drop(columns=["_dd_stmt", "_dd_presser"], inplace=True)
+
+    n_nonzero = (df["disagree_density"] > 0).sum()
+    print("Family D — disagreement density (vote record + presser acknowledgment):")
+    print(f"  Non-zero meetings: {n_nonzero}/{len(df)}")
+    print(df[["meeting_date", "disagree_density"]].query("disagree_density > 0").to_string(index=False))
     return df
 
 
-stmt = compute_family_d(stmt)
+stmt = compute_family_d(stmt, docs_raw_df=docs_raw)
 
 # %% ── Control feature: polarity / hawk-dove score ────────────────────────────
 # NOT a vol predictor. Label clearly as direction overlay.
@@ -3013,6 +3060,107 @@ def plot_feature_vol_heatmap(master_df: pd.DataFrame) -> plt.Figure:
 fig8b = plot_feature_vol_heatmap(master)
 plt.show()
 
+# %% ── 7.2b  Disagree density figure ─────────────────────────────────────────
+
+def plot_disagree_density(master_df: pd.DataFrame) -> plt.Figure:
+    """
+    fig8d: Family D disagreement density — two panels.
+
+    Top: time-series of disagree_density per meeting, shaded by chair era.
+         Captures episodic dissent clusters (2013 taper, 2017–18 Kashkari, 2019
+         Bullard/George, 2022 George vs hike pace, 2024–25 Bowman/Hammack).
+    Bottom: scatter of disagree_density vs GK event-day vol with OLS trendline.
+    """
+    hist = master_df[master_df["chair"] != "Warsh"].copy()
+    hist["meeting_date"] = pd.to_datetime(hist["meeting_date"])
+    hist = hist.dropna(subset=["disagree_density"]).sort_values("meeting_date")
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(13, 9), gridspec_kw={"height_ratios": [2, 1.5]}
+    )
+
+    # ── Top: time series by chair ────────────────────────────────────────────
+    for chair in ["Bernanke", "Yellen", "Powell"]:
+        sub   = hist[hist["chair"] == chair]
+        color = _CHAIR_COLORS.get(chair, "gray")
+        ax1.plot(sub["meeting_date"], sub["disagree_density"],
+                 color=color, lw=1.3, alpha=0.75, label=chair)
+        ax1.scatter(sub["meeting_date"], sub["disagree_density"],
+                    color=color, s=28, alpha=0.85, zorder=3)
+
+    # annotate top 5 dissent spikes
+    top5 = hist.nlargest(5, "disagree_density")
+    for _, row in top5.iterrows():
+        ax1.annotate(
+            f"{row['meeting_date'].strftime('%b %Y')}\n({row['disagree_density']:.2f})",
+            xy=(row["meeting_date"], row["disagree_density"]),
+            xytext=(row["meeting_date"] + pd.Timedelta(days=150),
+                    row["disagree_density"] + 0.08),
+            fontsize=7, color="black",
+            arrowprops=dict(arrowstyle="-", lw=0.5, color="gray"),
+        )
+
+    ax1.axhline(0, color="gray", lw=0.5, ls="--")
+    ax1.set_title(
+        "Family D — Disagreement Density over Time\n"
+        "(vote record dissents + presser chair acknowledgment)",
+        fontsize=11, fontweight="bold",
+    )
+    ax1.set_ylabel("disagree_density\n(regex hits / 100 words)", fontsize=9)
+    ax1.legend(fontsize=9, loc="upper left")
+    ax1.grid(lw=0.3, alpha=0.4)
+
+    # ── Bottom: scatter vs GK vol ────────────────────────────────────────────
+    vol_col = "gk_vol_10y"
+    if vol_col in hist.columns:
+        valid = hist.dropna(subset=[vol_col, "disagree_density"])
+        for chair in ["Bernanke", "Yellen", "Powell"]:
+            sub   = valid[valid["chair"] == chair]
+            color = _CHAIR_COLORS.get(chair, "gray")
+            ax2.scatter(sub["disagree_density"], sub[vol_col],
+                        color=color, alpha=0.75, s=40, label=chair, zorder=3)
+
+        x_arr = valid["disagree_density"].values
+        y_arr = valid[vol_col].values
+        if len(x_arr) > 10:
+            coeffs = np.polyfit(x_arr, y_arr, 1)
+            xr = np.linspace(x_arr.min(), x_arr.max(), 200)
+            ax2.plot(xr, np.polyval(coeffs, xr),
+                     color="black", ls="--", lw=1.0, alpha=0.6, label="OLS fit")
+
+        corr = valid["disagree_density"].corr(valid[vol_col])
+        n_nz = (valid["disagree_density"] > 0).sum()
+        ax2.set_title(
+            f"Disagree Density vs GK Event-Day Vol  (Pearson r={corr:+.3f}, "
+            f"n={len(valid)}, non-zero={n_nz})",
+            fontsize=10,
+        )
+        ax2.set_xlabel("disagree_density", fontsize=9)
+        ax2.set_ylabel("GK event-day vol (pp ann.)", fontsize=9)
+        ax2.legend(fontsize=8, loc="upper right")
+        ax2.grid(lw=0.3, alpha=0.4)
+    else:
+        ax2.text(0.5, 0.5, "GK vol not available in master",
+                 ha="center", va="center", transform=ax2.transAxes)
+
+    fig.suptitle(
+        "Family D: Disagreement Density — Dissent Signals vs Volatility\n"
+        f"Historical corpus  {hist['meeting_date'].dt.year.min()}–"
+        f"{hist['meeting_date'].dt.year.max()}",
+        fontsize=13, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    savefig(fig, "fig8d_disagree_density")
+    return fig
+
+
+fig8d = plot_disagree_density(master)
+plt.show()
+
+print(f"Provenance fig8d: master  rows={len(master)}  "
+      f"non-zero disagree_density="
+      f"{(master['disagree_density'].fillna(0)>0).sum()}/{len(master)}")
+
 # %% ── 7.3  Ridge regression model ───────────────────────────────────────────
 
 def fit_ridge_model(X_train: pd.DataFrame,
@@ -3237,5 +3385,6 @@ print(f"    fig7d_interactive.html      (sortable hover table)")
 print(f"    fig8a_word_vol_corr.png     (word-vol correlations)")
 print(f"    fig8b_feature_vol_heatmap.png (NLP × vol heatmap)")
 print(f"    fig8c_warsh_backtest.png    (Warsh OOS backtest)")
+print(f"    fig8d_disagree_density.png  (Family D time-series + scatter)")
 print(f"  fomc_features.parquet → {PARQUET_OUT.resolve()}")
 print("═" * 62)
