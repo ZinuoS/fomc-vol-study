@@ -148,6 +148,37 @@ MODEL = dict(
     SIGNAL_LABEL = "GBM NLP x regime (overheating, R2=+0.333)",
 )
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  GROUP C — SWAPTION MARKET INPUTS  (from broker/BGN mid at trade time)  ║
+# ║  Same vol view, different instrument.  Strike = fixed rate (yield %).   ║
+# ║  Pricing: Bachelier in bp space (F, K in bp; sigma in bp/yr)            ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+SWAPTION = dict(
+    # 2Y swaption leg — European ATM straddle (payer + receiver)
+    F_2Y_BP          = 397.808,   # 2Y fwd par swap rate (bp) = 3.97808% <- BGN/BBG
+    K_2Y_BP          = 398.0,     # ATM strike (bp, rounded to 1bp)        <- desk conv.
+    IMPL_VOL_2Y_BP   = 101.1,     # Normal vol (bp/yr)                     <- broker mid
+    DV01_2Y_SWAP     = 189.97,    # $/bp per $1M (≈ OTR 2Y; from IRDV01)  <- BBG
+    TENOR_2Y         = "2Y",      # underlying swap tenor
+    # 30Y swaption leg
+    F_30Y_BP         = 412.662,   # 30Y fwd par swap rate (bp) = 4.12662% <- BGN/BBG
+    K_30Y_BP         = 413.0,     # ATM strike (bp, rounded to 1bp)
+    IMPL_VOL_30Y_BP  = 72.8,      # Normal vol (bp/yr)                     <- broker mid
+    DV01_30Y_SWAP    = 1592.56,   # $/bp per $1M                           <- BBG
+    TENOR_30Y        = "30Y",
+    # Sizing anchor (same as futures)
+    N_30Y_SWAP       = 50_000_000,
+    # Swaption terms
+    EXPIRY_DATE      = "2026-07-31",
+    FIXING_LAG       = "T+2",
+    STYLE            = "European",
+    SETTLEMENT       = "Cash-settled (ISDA 2021 Definitions)",
+    VENUE            = "SEF / bilateral OTC",
+    # Transaction costs (OTC conventions)
+    HALF_SPREAD_BP   = 0.25,      # half b/a in bp (mid-market OTC benchmark)
+    COMMISSION_PER_M = 50.0,      # $/M notional (typical OTC processing fee)
+)
+
 # Derived dates / T
 T_DAYS = (date.fromisoformat(MARKET["EXPIRY_DATE"])
           - date.fromisoformat(MARKET["ENTRY_DATE"])).days
@@ -155,7 +186,7 @@ T_YR   = T_DAYS / 365.0
 
 # Input banner
 print("=" * 70)
-print("  GROUP A — MARKET INPUTS  (sets PREMIUM)")
+print("  GROUP A — FUTURES MARKET INPUTS  (sets PREMIUM)")
 print(f"  Entry {MARKET[\'ENTRY_DATE\']}  FOMC {MARKET[\'FOMC_DATE\']}  Expiry {MARKET[\'EXPIRY_DATE\']}")
 print(f"  T = {T_DAYS} cal days = {T_YR:.5f} yr")
 print(f"  2Y:  F={MARKET[\'F_2Y\']:.3f}pts  sigma_impl={MARKET[\'IMPLIED_VOL_2Y\']:.4f}pts/yr  DV01=${MARKET[\'DV01_2Y\']:.2f}/bp/$1M")
@@ -167,6 +198,11 @@ print(f"  {MODEL[\'SIGNAL_LABEL\']}")
 print(f"  Event SD 2Y = {MODEL[\'EVENT_SD_2Y_BPS_DAY\']} bp/day  |  30Y = {MODEL[\'EVENT_SD_30Y_BPS_DAY\']} bp/day")
 print(f"  rho = {MODEL[\'RHO\']}")
 print("  WARNING: never substitute MODEL values into MARKET dict or vice versa.")
+print("=" * 70)
+print("  GROUP C — SWAPTION MARKET INPUTS  (same vol view; OTC instrument)")
+print(f"  2Y  fwd={SWAPTION[\'F_2Y_BP\']/100:.5f}%  K={SWAPTION[\'K_2Y_BP\']/100:.4f}%  sigma={SWAPTION[\'IMPL_VOL_2Y_BP\']:.1f}bp/yr")
+print(f"  30Y fwd={SWAPTION[\'F_30Y_BP\']/100:.5f}%  K={SWAPTION[\'K_30Y_BP\']/100:.4f}%  sigma={SWAPTION[\'IMPL_VOL_30Y_BP\']:.1f}bp/yr")
+print(f"  Settlement: {SWAPTION[\'SETTLEMENT\']}")
 print("=" * 70)
 ''')
 
@@ -469,6 +505,242 @@ html_ticket = f"""
 
 from IPython.display import HTML, display as _dsp
 _dsp(HTML(html_ticket))
+''')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 7c — Section header: swaption trade ticket
+# ─────────────────────────────────────────────────────────────────────────────
+md("""
+# ## SECTION 3B — OTC Swaption Trade Ticket
+
+# Same volatility view as Section 3A, implemented via European ATM swaptions
+# on par-swap rates instead of exchange-listed futures options.
+#
+# Key differences from futures ticket:
+# - Strike K quoted as fixed rate (%), not price points
+# - Normal vol σ in bp/yr (basis-point per year; Bachelier in bp space)
+# - Dollar premium = price_bp × DV01 × N/$1M
+# - Settlement: cash via ISDA 2021 (no physical delivery of bond)
+# - No contract count — notional in $M directly
+# - All inputs from GROUP C (SWAPTION dict)
+""")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 7d — Swaption computation
+# ─────────────────────────────────────────────────────────────────────────────
+code('''
+# CELL 7d: Swaption leg economics (Bachelier in bp space)
+# F_bp, K_bp in basis points; sigma in bp/yr → price_bp in bp
+# Dollar premium: price_bp × DV01_$/bp × N/$1M
+
+sw = SWAPTION
+
+GS2  = b_straddle(sw["F_2Y_BP"],  sw["K_2Y_BP"],  T_YR, sw["IMPL_VOL_2Y_BP"])
+GS30 = b_straddle(sw["F_30Y_BP"], sw["K_30Y_BP"], T_YR, sw["IMPL_VOL_30Y_BP"])
+
+# Vega-neutral 2Y notional
+N_30Y_SW = float(sw["N_30Y_SWAP"])
+N_2Y_SW  = N_30Y_SW * (GS30["vega"] * sw["DV01_30Y_SWAP"]) / (GS2["vega"] * sw["DV01_2Y_SWAP"])
+
+# Premium: price_bp × DV01 × N/1M
+def prem_sw(g, dv01, notl):
+    return g["price"] * dv01 * notl / 1e6
+
+ps2   = prem_sw(GS2,  sw["DV01_2Y_SWAP"],  N_2Y_SW)
+ps30  = prem_sw(GS30, sw["DV01_30Y_SWAP"], N_30Y_SW)
+
+# Yield-vega: $/bp of vol move (vega_bp_per_(bp/yr) × DV01 × N/1M)
+yv2_sw  = GS2["vega"]  * sw["DV01_2Y_SWAP"]  * N_2Y_SW  / 1e6
+yv30_sw = GS30["vega"] * sw["DV01_30Y_SWAP"] * N_30Y_SW / 1e6
+
+# Dollar delta (for ATM straddle ≈ 0; residual from F≠K)
+dd2_sw  = GS2["delta"]  * sw["DV01_2Y_SWAP"]  * N_2Y_SW  / 1e6
+dd30_sw = GS30["delta"] * sw["DV01_30Y_SWAP"] * N_30Y_SW / 1e6
+
+# Transaction costs: half-spread + OTC commission
+cost2_sw  = (sw["HALF_SPREAD_BP"] * sw["DV01_2Y_SWAP"]  * N_2Y_SW  / 1e6
+             + sw["COMMISSION_PER_M"] * N_2Y_SW  / 1e6)
+cost30_sw = (sw["HALF_SPREAD_BP"] * sw["DV01_30Y_SWAP"] * N_30Y_SW / 1e6
+             + sw["COMMISSION_PER_M"] * N_30Y_SW / 1e6)
+
+net_prem_sw  = ps2 - ps30
+net_yv_sw    = yv2_sw - yv30_sw
+net_delta_sw = dd2_sw - dd30_sw
+
+vega_tol_sw = 0.05 * min(yv2_sw, yv30_sw)
+vn_flag_sw  = "≈ $0/bp ✓  vega-neutral" if abs(net_yv_sw) < vega_tol_sw else f"${net_yv_sw:+,.0f}/bp  ✗ NOT balanced"
+
+print(f"SWAPTION LEG ECONOMICS")
+print(f"  N_2Y_SW  = ${N_2Y_SW/1e6:.1f}M  |  N_30Y_SW = ${N_30Y_SW/1e6:.0f}M")
+print(f"  prem_2Y  = ${ps2:,.0f}   |  prem_30Y = ${ps30:,.0f}")
+print(f"  yv_2Y    = ${yv2_sw:,.0f}/bp  |  yv_30Y   = ${yv30_sw:,.0f}/bp")
+print(f"  Net premium  = ${net_prem_sw:+,.0f}  (positive = net PAY)")
+print(f"  Net yv       = {vn_flag_sw}")
+print(f"  Net delta    = ${net_delta_sw:+,.2f}/bp-yield-move")
+''')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 7e — Real swaption dealer-confirmation trade ticket (HTML)
+# ─────────────────────────────────────────────────────────────────────────────
+code('''
+# CELL 7e: Real swaption dealer-confirmation trade ticket (HTML)
+
+sw = SWAPTION
+
+def _swrow(field, v2, v30, style2="", style30=""):
+    td2  = f\'<td style="padding:5px 14px;background:{style2 or "white"};font-size:11px;">{v2}</td>\'
+    td30 = f\'<td style="padding:5px 14px;background:{style30 or "white"};font-size:11px;">{v30}</td>\'
+    tf   = f\'<td style="padding:5px 10px;color:#666;font-size:10.5px;border-right:1px solid #dde;">{field}</td>\'
+    return f\'<tr>{tf}{td2}{td30}</tr>\'
+
+def _swdiv(label=""):
+    lbl = label.upper() if label else "&nbsp;"
+    return (f\'<tr><td colspan="3" style="background:#ecf0f1;padding:3px 10px;\'
+            f\'font-size:9px;font-weight:bold;color:#555;letter-spacing:.6px;\'
+            f\'text-transform:uppercase;border-top:1px solid #ccd;">{lbl}</td></tr>\')
+
+sw_rows = "".join([
+    _swdiv("INSTRUMENT"),
+    _swrow("Type",
+           "Payer + Receiver Straddle",
+           "Payer + Receiver Straddle"),
+    _swrow("Underlying",
+           f"{sw[\'TENOR_2Y\']} par IRS (USD SOFR)",
+           f"{sw[\'TENOR_30Y\']} par IRS (USD SOFR)"),
+    _swrow("Direction",
+           "&#x25B2; BUY &nbsp;(long vol)",
+           "&#x25BC; SELL (short vol)",
+           style2="#e8f0fb", style30="#fef0ee"),
+    _swrow("Style / Venue",
+           f"{sw[\'STYLE\']}  |  {sw[\'VENUE\']}",
+           f"{sw[\'STYLE\']}  |  {sw[\'VENUE\']}"),
+
+    _swdiv("SIZE"),
+    _swrow("Notional", f"${N_2Y_SW/1e6:,.1f} M", f"${N_30Y_SW/1e6:,.0f} M"),
+
+    _swdiv("TERMS"),
+    _swrow("Fwd swap rate  F",
+           f"{sw[\'F_2Y_BP\']/100:.5f}%",
+           f"{sw[\'F_30Y_BP\']/100:.5f}%"),
+    _swrow("Strike  K (fixed rate)",
+           f"<b>{sw[\'K_2Y_BP\']/100:.4f}%</b>",
+           f"<b>{sw[\'K_30Y_BP\']/100:.4f}%</b>"),
+    _swrow("Expiry date", sw[\'EXPIRY_DATE\'], sw[\'EXPIRY_DATE\']),
+    _swrow("T (cal days)",
+           f"{T_DAYS}d = {T_YR:.5f} yr",
+           f"{T_DAYS}d = {T_YR:.5f} yr"),
+    _swrow("Fixing lag / CCY", f"{sw[\'FIXING_LAG\']}  |  USD", f"{sw[\'FIXING_LAG\']}  |  USD"),
+    _swrow("Settlement", sw[\'SETTLEMENT\'], sw[\'SETTLEMENT\']),
+
+    _swdiv("PRICING  (source: MARKET swaption vol — Group C)"),
+    _swrow("Normal vol  σ_N",
+           f"{sw[\'IMPL_VOL_2Y_BP\']:.1f} bp/yr",
+           f"{sw[\'IMPL_VOL_30Y_BP\']:.1f} bp/yr"),
+    _swrow("DV01 / bp",
+           f"${sw[\'DV01_2Y_SWAP\']:.2f} / bp per $1M",
+           f"${sw[\'DV01_30Y_SWAP\']:.2f} / bp per $1M"),
+    _swrow("Straddle price",
+           f"{GS2[\'price\']:.2f} bp",
+           f"{GS30[\'price\']:.2f} bp"),
+
+    _swdiv("CASHFLOW"),
+    _swrow("Spot premium",
+           f"<b style=\'color:#c0392b\'>${ps2:,.0f} PAY</b>",
+           f"<b style=\'color:#27ae60\'>${ps30:,.0f} RECEIVE</b>"),
+    _swrow("Transaction costs",
+           f"${cost2_sw:,.0f}",
+           f"${cost30_sw:,.0f}"),
+    _swrow("Net all-in cost",
+           f"<b>${ps2 + cost2_sw:,.0f}</b>",
+           f"<b>${ps30 - cost30_sw:,.0f}</b>"),
+
+    _swdiv("GREEKS (dollar)"),
+    _swrow("Yield-vega  $/bp",
+           f"${yv2_sw:,.0f}",
+           f"${yv30_sw:,.0f}"),
+    _swrow("Dollar delta  $/bp",
+           f"${dd2_sw:+,.0f}",
+           f"${dd30_sw:+,.0f}"),
+])
+
+# Vega-neutral net indicator
+net_yv_display_sw = f"≈ $0/bp&nbsp;&nbsp;&#x2713;&nbsp;vega-neutral" if abs(net_yv_sw) < vega_tol_sw else f"${net_yv_sw:+,.0f}/bp&nbsp;&#x2717;"
+net_yv_color_sw   = "#27ae60" if abs(net_yv_sw) < vega_tol_sw else "#c0392b"
+
+sw_ticket = f"""
+<div style="font-family:\'Helvetica Neue\',Arial,sans-serif;max-width:720px;
+     border:1px solid #aab;border-radius:4px;overflow:hidden;margin:12px 0;">
+
+  <!-- ── title bar ── -->
+  <div style="background:#1a2637;color:#f0f4ff;padding:10px 18px;display:flex;
+       justify-content:space-between;align-items:center;">
+    <div>
+      <span style="font-size:13px;font-weight:bold;letter-spacing:.5px;">
+        TRADE CONFIRMATION &mdash; OTC INTEREST RATE SWAPTION
+      </span><br>
+      <span style="font-size:10px;color:#8ba0c0;">
+        Instrument: European ATM Straddle (Payer + Receiver)&nbsp;&nbsp;|&nbsp;&nbsp;
+        Underlying: {sw[\'TENOR_2Y\']} / {sw[\'TENOR_30Y\']} USD SOFR IRS
+      </span>
+    </div>
+    <div style="text-align:right;font-size:10px;color:#8ba0c0;">
+      Entry {MARKET[\'ENTRY_DATE\']}<br>
+      Expiry {sw[\'EXPIRY_DATE\']}
+    </div>
+  </div>
+
+  <!-- ── leg header row ── -->
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr>
+        <th style="width:32%;background:#2c3e50;color:#cdd;padding:6px 10px;
+            font-size:10px;text-align:left;border-right:1px solid #445;">FIELD</th>
+        <th style="width:34%;background:#2c4a7c;color:#e8f0ff;padding:6px 14px;
+            font-size:11px;text-align:left;">
+          LEG 1 &mdash; BUY &nbsp;&nbsp;{sw[\'TENOR_2Y\']} Straddle
+        </th>
+        <th style="width:34%;background:#7c2c2c;color:#ffe8e8;padding:6px 14px;
+            font-size:11px;text-align:left;">
+          LEG 2 &mdash; SELL &nbsp;{sw[\'TENOR_30Y\']} Straddle
+        </th>
+      </tr>
+    </thead>
+    <tbody>
+      {sw_rows}
+    </tbody>
+  </table>
+
+  <!-- ── NET footer ── -->
+  <div style="background:#1e3a28;color:#dff5e8;padding:10px 18px;
+       display:flex;gap:28px;flex-wrap:wrap;">
+    <div>
+      <span style="font-size:10px;color:#9dc;text-transform:uppercase;letter-spacing:.5px;">Net Premium</span><br>
+      <span style="font-size:15px;font-weight:bold;color:#c0392b;">${net_prem_sw:+,.0f} PAY</span>
+    </div>
+    <div>
+      <span style="font-size:10px;color:#9dc;text-transform:uppercase;letter-spacing:.5px;">Net Yield-Vega</span><br>
+      <span style="font-size:15px;font-weight:bold;color:{net_yv_color_sw};">{net_yv_display_sw}</span>
+    </div>
+    <div>
+      <span style="font-size:10px;color:#9dc;text-transform:uppercase;letter-spacing:.5px;">Net Delta (approx)</span><br>
+      <span style="font-size:15px;font-weight:bold;color:#dff5e8;">${net_delta_sw:+,.0f}/bp</span>
+    </div>
+  </div>
+
+  <!-- ── footnote ── -->
+  <div style="background:#f7f9fc;border-top:1px solid #ccd;padding:6px 18px;
+       font-size:9.5px;color:#888;">
+    Premium priced from <b>MARKET</b> swaption vol (Group&nbsp;C) via Bachelier (bp space).&nbsp;&nbsp;|&nbsp;&nbsp;
+    Strike = ATM fixed rate rounded to 1&nbsp;bp convention.&nbsp;&nbsp;|&nbsp;&nbsp;
+    MC jump from <b>MODEL</b> event-SD (Group&nbsp;B) &mdash; never conflated.&nbsp;&nbsp;|&nbsp;&nbsp;
+    All levels PLACEHOLDER &mdash; overwrite SWAPTION dict from live BGN/broker before booking.
+  </div>
+
+</div>
+"""
+
+from IPython.display import HTML, display as _dsp
+_dsp(HTML(sw_ticket))
 ''')
 
 # ─────────────────────────────────────────────────────────────────────────────
