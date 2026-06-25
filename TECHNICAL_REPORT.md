@@ -414,13 +414,6 @@ The original level-vol model predicted SELL-30Y-VOL for the June 2026 Warsh meet
 
 ## 5. Data Integrity Decisions
 
-### 5.1 No Lookahead in Any Feature
-
-All features use strictly backward-looking data at time `t`:
-- FRED macro series: point-in-time releases, not revised values (real-time data caveat noted)
-- PCA fitted on `{1,...,t-1}`, never including `t`
-- `StandardScaler` fit on training window only
-
 ### 5.2 Regime Label Independence
 
 Regime labels are constructed from macroeconomic gaps, not from vol outcomes. This is the **key identification assumption**: if regime labels were derived from vol (e.g., "overheating = high vol periods"), the regime-interaction model would be tautological.
