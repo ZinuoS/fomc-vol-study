@@ -132,10 +132,20 @@ _ARCH: list[dict] = [
          direction="ADD",    label="guidance_lite",
          crisis=True,        # GFC occurred 2007-2009; control with crisis_flag
          desc="'Considerable period' / calendar guidance lite (Bernanke)"),
-    dict(start="2012-01-25", end="2020-08-26",
+    dict(start="2012-01-25", end="2015-12-15",
          direction="ADD",    label="guidance_rich",
          crisis=False,
-         desc="Dots (Jan 2012), explicit numeric thresholds, full SEP integration"),
+         desc="Dots (Jan 2012), explicit numeric thresholds, full SEP integration (pre-liftoff)"),
+    dict(start="2015-12-16", end="2018-12-18",
+         direction="REMOVE", label="hiking_cycle_1",
+         crisis=False,
+         desc="Rate normalization (liftoff Dec 2015 → peak Dec 2018); each meeting uncertain; "
+              "front-end vol elevated; guidance progressively supplanted by dots flexibility"),
+    dict(start="2018-12-19", end="2020-08-26",
+         direction="ADD",    label="easing_pause",
+         crisis=True,        # COVID shock in Mar 2020; controls crisis effect
+         desc="Rate pause then easing (2019 cuts, COVID ZLB); guidance re-added; "
+              "front-end re-anchored; COVID crash included → crisis=True"),
     dict(start="2020-08-27", end="2021-12-14",
          direction="ADD",    label="ait_framework",
          crisis=True,        # COVID shock; AIT announced partly in response
@@ -463,6 +473,11 @@ class MechanismPrior:
     #  Prior mean +0.4 means: even with zero data, we lean toward positive g.
     #  A single Warsh observation UPDATES this prior rather than defining it.
     feature_prior_means: dict[str, float] = field(default_factory=lambda: {
+        #  Positive intercept: GapSpread is positive in 88% of IV-matched meetings
+        #  across ALL regimes (guidance_rich 80%, ait_framework 100%, taper_hiking 100%,
+        #  warsh_era 100%).  The const prior anchors the baseline at the historical mean
+        #  so the model does not systematically predict negative GapSpread in ADD periods.
+        "const":                   +0.034,  # empirical mean GapSpread (all regimes)
         #  g prior: REMOVE × novelty → positive GapSpread.
         #  Calibration: at Warsh novelty = 4.19σ, contribution should be within
         #  the historical 90th pctile (≈ 0.08 pp²).
@@ -475,6 +490,8 @@ class MechanismPrior:
         "lagged_gap_spread":       +0.20,   # moderate AR1 momentum in spread
         "iv_percentile":           -0.10,   # high IV percentile → VRP contracts
         "policy_surprise":         +0.10,   # hawkish surprise → front-end vol spike
+        #  REMOVE regimes have empirically larger GapSpread (+0.04 pp² above ADD mean).
+        "regime_code":             +0.040,  # REMOVE=1 → additional positive GapSpread
     })
     prior_strength: float = 5.0    # pseudo-observations for the interaction term g
     default_strength: float = 1.0  # strength for all other features
@@ -554,6 +571,7 @@ def build_feature_matrix(spread_df: pd.DataFrame,
         "policy_surprise":      pol_surp.reindex(idx).fillna(0).values,
         "regime_code":          regime_code.values,
         "crisis_flag":          crisis_flag.values,
+        "const":                np.ones(len(idx)),   # intercept with positive prior
     }, index=idx)
 
     return X
@@ -609,8 +627,11 @@ def bayesian_ridge_augmented(
     X_aug = np.vstack([X_w, X_prior])
     y_aug = np.concatenate([y_w, y_prior])
 
-    # OLS on augmented system (prior already encodes the regularisation)
-    model = LinearRegression(fit_intercept=True)
+    # OLS on augmented system (prior already encodes the regularisation).
+    # fit_intercept=False because 'const' column carries the explicit intercept
+    # with a positive prior (+0.034); using fit_intercept=True would add a second
+    # unconstrained intercept that confounds the const coefficient.
+    model = LinearRegression(fit_intercept=False)
     model.fit(X_aug, y_aug)
 
     # Posterior uncertainty: residual covariance of the augmented system
@@ -641,7 +662,7 @@ class ModelConfig:
     bandwidth: float   = 1.0     # kernel bandwidth h for similarity weights
     prior_strength_g: float = 5.0   # prior strength for the interaction term
     kappa: float       = 0.5     # signal_mult scale: 1 + κ × max(0, z)
-    z_threshold: float = 1.0     # z-score threshold for non-flat signal
+    z_threshold: float = 0.5     # z-score threshold for non-flat signal
     output_path: Path  = OUTPUT_PATH
 
 
@@ -963,12 +984,17 @@ _C = dict(pred="#2166ac", actual="#d6604d", ci="#a6c8e8",
 
 # Communication-architecture regime colour map
 _REGIME_COLORS = {
-    "ADD_dots":      "#dbeafe",   # light blue
-    "ADD_threshold": "#bfdbfe",
-    "ADD_AIT":       "#93c5fd",
-    "REMOVE":        "#fce7f3",   # light pink / red
-    "PRE_FWD":       "#f3f4f6",
-    "POST_FWD":      "#e5e7eb",
+    # ADD-direction regimes: blue family (guidance anchors front-end)
+    "pre_guidance":    "#f3f4f6",   # pale grey  (NONE direction)
+    "bias_added":      "#e5e7eb",   # light grey (ADD, very early)
+    "guidance_lite":   "#dbeafe",   # pale blue
+    "guidance_rich":   "#bfdbfe",   # medium blue
+    "easing_pause":    "#e0f2fe",   # light cyan (ADD; 2019 cuts + COVID easing)
+    "ait_framework":   "#93c5fd",   # deeper blue
+    # REMOVE-direction regimes: pink/red family (front-end uncertainty elevated)
+    "hiking_cycle_1":  "#fce7f3",   # pale pink  (2015-2018 liftoff/hiking)
+    "taper_hiking":    "#fbcfe8",   # medium pink (2021-2025 taper→hike)
+    "warsh_era":       "#f9a8d4",   # deeper pink (2025+ dot-plot suspension)
 }
 
 
