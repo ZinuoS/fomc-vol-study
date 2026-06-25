@@ -845,6 +845,36 @@ def compute_vrp_gap(realized: pd.DataFrame, implied: pd.DataFrame) -> pd.DataFra
 
 
 vrp_panel = compute_vrp_gap(realized_curve, implied_curve)
+
+# ── ETF IV fallback: fill post-May-2020 gap (NaN after left-join above) ──────
+_etf_gap_path = Path("etf_gap_curve.parquet")
+if _etf_gap_path.exists():
+    _etf = pd.read_parquet(_etf_gap_path)
+    _etf["meeting_date"] = pd.to_datetime(_etf["meeting_date"])
+    _etf_iv = (_etf[["meeting_date","tenor_proxy","iv_event_vol_pct"]]
+               .rename(columns={"tenor_proxy": "tenor", "iv_event_vol_pct": "iv_etf_pct"})
+               .dropna(subset=["iv_etf_pct"]))
+    vrp_panel = vrp_panel.merge(_etf_iv, on=["meeting_date","tenor"], how="left")
+    _missing = vrp_panel["iv_event_vol"].isna() & vrp_panel["iv_etf_pct"].notna()
+    vrp_panel.loc[_missing, "iv_event_vol"] = vrp_panel.loc[_missing, "iv_etf_pct"]
+    vrp_panel.loc[_missing, "iv_event_var"] = (vrp_panel.loc[_missing, "iv_etf_pct"] / 100) ** 2
+    vrp_panel.loc[_missing, "gap_var"] = (
+        vrp_panel.loc[_missing, "iv_event_var"] - vrp_panel.loc[_missing, "rv_event_var"]
+    )
+    # iv_event_bps = pct × 100 × yield_ratio / (dur_10y × price_ratio)
+    for _t, _idx in vrp_panel[_missing].groupby("tenor").groups.items():
+        _ps = _price_vol_ratios.get(_t, 1.0)
+        _ys = _fomc_yield_ratios.get(_t, 1.0)
+        _bps = vrp_panel.loc[_idx, "iv_etf_pct"] * 100.0 * _ys / (max(_dur_10y, 1.0) * _ps)
+        vrp_panel.loc[_idx, "iv_event_bps"] = _bps
+        vrp_panel.loc[_idx, "gap_yc_bps"]   = _bps - vrp_panel.loc[_idx, "rv_event_yc"]
+        vrp_panel.loc[_idx, "gap_yc_bps2"]  = (
+            _bps ** 2 - vrp_panel.loc[_idx, "rv_event_yc"] ** 2
+        )
+    print(f"ETF IV fallback  : {_missing.sum()} rows filled  "
+          f"(total IV obs: {vrp_panel['iv_event_vol'].notna().sum()})")
+    vrp_panel.drop(columns=["iv_etf_pct"], inplace=True)
+
 vrp_panel.to_parquet(Path("vrp_cache") / "vrp_panel.parquet", index=False)
 
 # %% [markdown]
@@ -1489,6 +1519,10 @@ def build_panel(vrp_panel: pd.DataFrame, claude_scores: pd.DataFrame,
     panel = panel.sort_values(["tenor","meeting_date"])
     panel["rv_lag1"]    = panel.groupby("tenor")["rv_event_var"].shift(1)
     panel["rv_yc_lag1"] = panel.groupby("tenor")["rv_event_yc"].shift(1)
+    panel["rv_ewma3"]    = panel.groupby("tenor")["rv_event_var"].transform(
+        lambda x: x.ewm(span=3, adjust=False).mean().shift(1))
+    panel["rv_yc_ewma3"] = panel.groupby("tenor")["rv_event_yc"].transform(
+        lambda x: x.ewm(span=3, adjust=False).mean().shift(1))
 
     # Tenor × factor interactions
     panel["f1_x_tenor"] = panel["factor_1"] * panel["tenor_code"]
