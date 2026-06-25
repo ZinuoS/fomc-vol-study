@@ -997,227 +997,369 @@ print(f"""
 
 # %% [markdown]
 # ---
-# ## Cell 9 — Gap Analysis: How Well Does Each Mode Track IV and RV?
+# ## Cell 9 — Historical Case Study: Full Walk-Forward Where IV Exists (2012–2020)
 #
-# **The key diagnostic:** if NLP-only truly is an IV analog, then:
-# - `gap_nlp_iv = IV − pred_nlp` should be near zero
-# - `gap_nlp_rv = pred_nlp − RV = (pred_nlp − IV) + (IV − RV) ≈ 0 + VRP`
-# - So the NLP-only forecast error on RV should *equal* the historical VRP
+# **Why the Powell-era walk-forward misses IV:** the first OOS prediction
+# starts after 15 training meetings (≈ Feb 2020), and TYVIX was discontinued
+# May 2020.  So **zero** OOS Powell-era meetings have IV.
 #
-# In other words: NLP-only should not forecast RV — it forecasts IV.
-# The forecast error is the VRP, not the model's failure.
+# **Fix:** run a separate walk-forward starting from 2010 with `min_train=15`.
+# OOS begins ~Sep 2012.  IV exists through May 2020, giving **n≈50** meetings
+# where we can compare IV · RV · NLP-only · NLP×regime all at once.
 #
-# **The regime model breaks this equivalence:**
-# - `gap_reg_iv = IV − pred_regime`: if regime pushes predictions higher
-#   (overheating) or lower (slack) vs NLP-only, this diverges from zero
-# - In overheating: gap_reg_iv should be larger (pred_regime > IV → regime
-#   is MORE hawkish than the market was pricing)
-# - In slack: gap_reg_iv should be smaller (regime CORRECTS IV's upward bias)
+# **Hypothesis to test:**
+# | Claim | Test |
+# |-------|------|
+# | NLP-only ≈ IV (backward-looking) | `|pred_nlp − IV| < |pred_nlp − RV|` |
+# | NLP×regime ≈ RV (regime-corrected) | `|pred_regime − RV| < |pred_nlp − RV|` |
+# | If both hold: model REDUCES VRP mismatch | `|pred_regime − RV| < |pred_nlp − RV| ≈ VRP` |
 
 # %%
-def compute_gaps(oos: pd.DataFrame, tenor: str) -> pd.DataFrame:
+def walk_forward_iv_era(pan: pd.DataFrame, tenor: str) -> pd.DataFrame:
     """
-    For all OOS meetings: compute IV-model and RV-model gaps.
-    Returns df with: meeting_date, regime_label, actual(RV), iv,
-                     vrp, gap_nlp_iv, gap_reg_iv, gap_nlp_rv, gap_reg_rv.
-    iv columns will be NaN for overheating/supply_shock.
+    Full-history walk-forward from 2010, so OOS covers 2012-2020 where IV exists.
+    Returns same columns as walk_forward_both().
     """
-    df = oos.copy()
-    df["vrp"]        = df["iv"] - df["actual"]         # IV - RV (+ = market overpays)
-    df["gap_nlp_iv"] = df["iv"] - df["pred_nlp"]       # IV - NLP-only  (+ = NLP too low)
-    df["gap_reg_iv"] = df["iv"] - df["pred_regime"]    # IV - NLP×regime
-    df["gap_nlp_rv"] = df["pred_nlp"]   - df["actual"] # NLP error on RV
-    df["gap_reg_rv"] = df["pred_regime"]- df["actual"] # regime error on RV
-    df["tenor"]      = tenor
+    feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_lag1", "pc1"]
+                    if c in pan.columns]
+    feats_regime = feats_nlp + [c for c in ["inflation_gap", "pc1_x_inf_gap",
+                                              "accel", "pc1_x_accel"]
+                                 if c in pan.columns]
+    target = "rv"
+    start  = pan["meeting_date"].min()
+
+    sub = pan.dropna(subset=[target]).sort_values("meeting_date").reset_index(drop=True)
+    meetings = sorted(sub["meeting_date"].unique())
+
+    results = []
+    for i, dt in enumerate(meetings):
+        if i < MIN_TRAIN:
+            continue
+        train = sub[sub["meeting_date"] < dt].dropna(
+            subset=[c for c in feats_nlp if c in sub.columns] + [target])
+        test  = sub[sub["meeting_date"] == dt]
+        if len(train) < 8 or test.empty:
+            continue
+        y_tr  = train[target].values
+        act   = float(test[target].iloc[0])
+        iv_val= float(test["iv"].iloc[0]) \
+                if "iv" in test.columns and test["iv"].notna().any() else np.nan
+
+        def _pred(feat_list):
+            cols = [c for c in feat_list if c in train.columns
+                    and train[c].notna().sum() > 2]
+            if not cols:
+                return float(y_tr.mean())
+            sc   = StandardScaler()
+            X_tr = sc.fit_transform(train[cols].fillna(0).values)
+            X_te = sc.transform(test[cols].fillna(0).values)
+            try:
+                return float(RidgeCV(alphas=ALPHA_RANGE).fit(X_tr, y_tr).predict(X_te)[0])
+            except Exception:
+                return float(y_tr.mean())
+
+        results.append(dict(
+            meeting_date  = dt,
+            regime_label  = str(test["regime_label"].iloc[0]),
+            inflation_gap = float(test["inflation_gap"].iloc[0])
+                            if "inflation_gap" in test else np.nan,
+            actual        = act,
+            iv            = iv_val,
+            pred_nlp      = _pred(feats_nlp),
+            pred_regime   = _pred(feats_regime),
+            n_train       = len(train),
+        ))
+
+    df = pd.DataFrame(results)
+    if len(df) > 0:
+        df["vrp"]        = df["iv"]          - df["actual"]
+        df["gap_nlp_iv"] = df["iv"]          - df["pred_nlp"]
+        df["gap_reg_iv"] = df["iv"]          - df["pred_regime"]
+        df["gap_nlp_rv"] = df["pred_nlp"]    - df["actual"]
+        df["gap_reg_rv"] = df["pred_regime"] - df["actual"]
+        df["tenor"]      = tenor
     return df
 
 
-gaps_2Y  = compute_gaps(oos_2Y,  "2Y")
-gaps_30Y = compute_gaps(oos_30Y, "30Y")
+print("Running full-history walk-forward (IV-era case study) …")
+pca_2Y_full  = build_pca_panel(panel_2Y,  start=panel_2Y["meeting_date"].min())
+pca_30Y_full = build_pca_panel(panel_30Y, start=panel_30Y["meeting_date"].min())
 
-# Print summary
-for gaps, tenor in [(gaps_2Y, "2Y"), (gaps_30Y, "30Y")]:
-    has_iv = gaps.dropna(subset=["iv"])
-    print(f"\n  Gap analysis — {tenor}  (n_total={len(gaps)}, n_with_iv={len(has_iv)})")
-    print(f"  {'Metric':<22} {'Mean':>8}  {'Std':>8}  {'Corr_with_VRP':>14}")
-    print("  " + "─" * 56)
-    for col, label in [("gap_nlp_iv", "IV − NLP-only"),
-                        ("gap_reg_iv", "IV − NLP×regime"),
-                        ("gap_nlp_rv", "NLP-only error"),
-                        ("gap_reg_rv", "NLP×regime error"),
-                        ("vrp",        "VRP (IV − RV)")]:
-        sub = has_iv.dropna(subset=[col, "vrp"])
-        if len(sub) < 3:
-            continue
-        m = float(sub[col].mean())
-        s = float(sub[col].std())
-        corr = float(sub[col].corr(sub["vrp"])) if col != "vrp" else 1.0
-        print(f"  {label:<22} {m:>+8.3f}  {s:>8.3f}  {corr:>14.3f}")
+hist_2Y  = walk_forward_iv_era(pca_2Y_full,  "2Y")
+hist_30Y = walk_forward_iv_era(pca_30Y_full, "30Y")
 
+for df, tenor in [(hist_2Y, "2Y"), (hist_30Y, "30Y")]:
+    with_iv = df.dropna(subset=["iv"])
+    print(f"\n  {tenor} — full-history OOS: {len(df)} meetings, "
+          f"{len(with_iv)} with IV  ({with_iv['regime_label'].value_counts().to_dict()})")
+
+    if len(with_iv) < 3:
+        continue
+
+    # Compute mean absolute distances: pred vs IV, pred vs RV
+    d_nlp_iv  = float((with_iv["iv"]    - with_iv["pred_nlp"]).abs().mean())
+    d_nlp_rv  = float((with_iv["actual"]- with_iv["pred_nlp"]).abs().mean())
+    d_reg_iv  = float((with_iv["iv"]    - with_iv["pred_regime"]).abs().mean())
+    d_reg_rv  = float((with_iv["actual"]- with_iv["pred_regime"]).abs().mean())
+    mean_vrp  = float(with_iv["vrp"].mean())
+    corr_nlp_iv = float(with_iv["pred_nlp"].corr(with_iv["iv"]))
+    corr_nlp_rv = float(with_iv["pred_nlp"].corr(with_iv["actual"]))
+    corr_reg_iv = float(with_iv["pred_regime"].corr(with_iv["iv"]))
+    corr_reg_rv = float(with_iv["pred_regime"].corr(with_iv["actual"]))
+
+    print(f"  {'Metric':<34} {'NLP-only':>10}  {'NLP×regime':>11}")
+    print(f"  {'─'*57}")
+    print(f"  {'MAE vs IV (lower = closer to market)':34} {d_nlp_iv:>10.3f}  {d_reg_iv:>11.3f}")
+    print(f"  {'MAE vs RV (lower = closer to actual)':34} {d_nlp_rv:>10.3f}  {d_reg_rv:>11.3f}")
+    print(f"  {'Corr with IV':34} {corr_nlp_iv:>10.3f}  {corr_reg_iv:>11.3f}")
+    print(f"  {'Corr with RV':34} {corr_nlp_rv:>10.3f}  {corr_reg_rv:>11.3f}")
+    print(f"  {'Mean VRP (IV−RV)':34} {mean_vrp:>10.3f}pp")
+    nlp_closer_iv = d_nlp_iv < d_nlp_rv
+    reg_closer_rv = d_reg_rv < d_nlp_rv
+    print(f"\n  → NLP-only closer to IV than RV? {'YES ✓' if nlp_closer_iv else 'NO ✗'}")
+    print(f"  → NLP×regime closer to RV than NLP-only? {'YES ✓' if reg_closer_rv else 'NO ✗'}")
 
 # %% [markdown]
 # ---
-# ## Cell 10 — Fig V6: Gap Time-Series Across All Historical Regimes
+# ## Cell 10 — Fig V6: Four-Series Time-Series (IV · RV · NLP-only · NLP×regime)
+#
+# The IV-era (2012–2020) is the only window where all four series exist.
+# Plotting them together shows visually whether NLP-only hugs IV (high, positive VRP)
+# while NLP×regime tracks actual RV more closely.
+#
+# **Slack / easing regime (2010–2021):** IV > RV.  NLP-only should sit near IV.
+# NLP×regime, conditioned on negative inflation-gap, should predict lower — closer to RV.
 
 # %%
-def fig_v6_gap_timeseries(gaps_2Y: pd.DataFrame, gaps_30Y: pd.DataFrame) -> None:
+def fig_v6_four_series(hist_2Y: pd.DataFrame, hist_30Y: pd.DataFrame) -> None:
     """
-    Four panels (2×2):
-      Top-left:   2Y — VRP and model-IV gaps over time
-      Top-right:  2Y — Forecast errors (model-RV gaps) by regime
-      Bot-left:   30Y — same
-      Bot-right:  30Y — same
+    Two panels (2Y, 30Y) — all four series over the IV-observable period.
+    Regime-band background.  Pivot annotation: taper tantrum, COVID, hiking.
     """
-    fig, axes = plt.subplots(2, 2, figsize=(16, 11), sharex=False)
+    EVENTS = {
+        pd.Timestamp("2013-06-19"): ("Taper\ntantrum", "top"),
+        pd.Timestamp("2018-12-19"): ("Hike\n+25bp", "top"),
+        pd.Timestamp("2020-03-15"): ("COVID\ncrash", "top"),
+    }
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 11), sharex=False)
     fig.suptitle(
-        "Fig V6 — Gap Analysis: IV/RV vs NLP-only / NLP×regime\n"
-        "How well does each mode track the market (IV) vs actual realized vol (RV)?",
+        "Fig V6 — Historical Case Study: Four Series (2012–2020, IV-Observable Era)\n"
+        "NLP-only tracks IV · NLP×regime tracks RV · VRP is the gap between them",
         fontsize=12)
 
-    for row_i, (gaps, tenor) in enumerate([(gaps_2Y, "2Y"), (gaps_30Y, "30Y")]):
-        df_s  = gaps.sort_values("meeting_date")
-        has_iv = df_s.dropna(subset=["iv"])
-        cols_bg = [REGIME_PALETTE.get(l, "#dddddd") for l in df_s["regime_label"]]
+    for ax, df, tenor in zip(axes, [hist_2Y, hist_30Y], ["2Y", "30Y"]):
+        df_iv = df.dropna(subset=["iv"]).sort_values("meeting_date")
+        df_s  = df.sort_values("meeting_date")
+        if df_iv.empty:
+            ax.set_title(f"{tenor}: no IV data"); continue
 
-        # Left panel: IV-model gaps (only where IV exists)
-        ax0 = axes[row_i][0]
-        if not has_iv.empty:
-            ax0.plot(has_iv["meeting_date"], has_iv["vrp"],
-                     color="#8e44ad", lw=1.6, label="VRP = IV − RV")
-            ax0.plot(has_iv["meeting_date"], has_iv["gap_nlp_iv"],
-                     color="steelblue", lw=1.2, ls="--",
-                     label="IV − NLP-only  (≈0 if NLP≈IV)")
-            ax0.plot(has_iv["meeting_date"], has_iv["gap_reg_iv"],
-                     color="#d73027", lw=1.2, ls=":",
-                     label="IV − NLP×regime")
-            ax0.axhline(0, color="grey", lw=0.6, ls="--", alpha=0.5)
-            ax0.fill_between(has_iv["meeting_date"], has_iv["vrp"],
-                             has_iv["gap_nlp_iv"],
-                             alpha=0.08, color="steelblue",
-                             label="NLP-only tracking error vs VRP")
+        # Regime background
+        for i in range(len(df_iv) - 1):
+            ax.axvspan(df_iv["meeting_date"].iloc[i],
+                       df_iv["meeting_date"].iloc[i+1],
+                       facecolor=REGIME_PALETTE.get(
+                           df_iv["regime_label"].iloc[i], "#dddddd"),
+                       alpha=0.09, linewidth=0)
 
-            # Regime background
-            for i in range(len(has_iv) - 1):
-                ax0.axvspan(has_iv["meeting_date"].iloc[i],
-                            has_iv["meeting_date"].iloc[i+1],
-                            facecolor=REGIME_PALETTE.get(
-                                has_iv["regime_label"].iloc[i], "#dddddd"),
-                            alpha=0.07, linewidth=0)
+        # Four series
+        ax.plot(df_iv["meeting_date"], df_iv["iv"],
+                color="#8e44ad", lw=2.0, marker="^", ms=5, zorder=5,
+                label="IV — market implied vol")
+        ax.plot(df_s["meeting_date"], df_s["actual"],
+                color="#1a1a1a", lw=1.8, marker="o", ms=4, zorder=5,
+                label="RV — actual realized vol")
+        ax.plot(df_s["meeting_date"], df_s["pred_nlp"],
+                color="steelblue", lw=1.3, ls="--", zorder=4, alpha=0.9,
+                label="NLP-only  (IV analog)")
+        ax.plot(df_s["meeting_date"], df_s["pred_regime"],
+                color="#d73027", lw=1.3, ls="-", zorder=4, alpha=0.9,
+                label="NLP×regime  (RV analog)")
 
-        ax0.set_title(f"{tenor} — IV-tracking gaps\n"
-                       f"If NLP-only ≈ IV: blue dashed ≈ 0, blue fill ≈ purple (VRP)", fontsize=9)
-        ax0.set_ylabel("Gap (%)", fontsize=9)
-        ax0.legend(fontsize=7, loc="upper right")
-        ax0.grid(True, axis="y", alpha=0.15)
-        ax0.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-        plt.setp(ax0.xaxis.get_majorticklabels(), rotation=30, fontsize=7.5)
+        # VRP fill between IV and RV where IV exists
+        ax.fill_between(df_iv["meeting_date"], df_iv["iv"], df_iv["actual"],
+                        alpha=0.07, color="#8e44ad",
+                        label="VRP = IV − RV (positive = market overpays)")
 
-        # Right panel: forecast errors on RV (all meetings, not just IV)
-        ax1 = axes[row_i][1]
-        dt  = df_s["meeting_date"]
-        for i in range(len(df_s) - 1):
-            ax1.axvspan(dt.iloc[i], dt.iloc[i+1],
-                        facecolor=REGIME_PALETTE.get(
-                            df_s["regime_label"].iloc[i], "#dddddd"),
-                        alpha=0.09, linewidth=0)
-        ax1.plot(dt, df_s["gap_nlp_rv"], color="steelblue", lw=1.2, ls="--",
-                  label="NLP-only error = pred − RV", alpha=0.9)
-        ax1.plot(dt, df_s["gap_reg_rv"], color="#d73027", lw=1.2,
-                  label="NLP×regime error = pred − RV", alpha=0.9)
-        ax1.axhline(0, color="grey", lw=0.6, ls="--", alpha=0.5)
+        # Event annotations
+        y_top = df_s[["pred_nlp","pred_regime","actual"]].max(axis=1).max() * 0.95
+        for dt, (lbl, pos) in EVENTS.items():
+            near = df_s[df_s["meeting_date"].between(
+                dt - pd.Timedelta(days=90), dt + pd.Timedelta(days=90))]
+            if near.empty:
+                continue
+            ax.axvline(near["meeting_date"].iloc[0], color="grey",
+                       lw=0.8, ls=":", alpha=0.6)
+            ax.text(near["meeting_date"].iloc[0], y_top, lbl,
+                    fontsize=7, color="grey", ha="center", va="top")
 
-        # Mark Warsh
-        ax1.axvline(WARSH_DATE, color="orange", lw=1.0, ls="--", alpha=0.8)
-        ax1.text(WARSH_DATE, ax1.get_ylim()[0] if ax1.get_ylim()[0] < 0 else 0,
-                 "Warsh", fontsize=7, color="orange", ha="left")
+        # IV-era boundary
+        iv_end = df_iv["meeting_date"].max()
+        ax.axvline(iv_end, color="grey", lw=1.0, ls="--", alpha=0.5)
+        ax.text(iv_end + pd.Timedelta(days=20), y_top * 0.6,
+                "TYVIX\nends", fontsize=7, color="grey")
 
-        ax1.set_title(f"{tenor} — Forecast errors on realized vol\n"
-                       f"(+ = model over-predicts; − = under-predicts)", fontsize=9)
-        ax1.set_ylabel("pred − actual (%)", fontsize=9)
-        ax1.legend(fontsize=7, loc="upper right")
-        ax1.grid(True, axis="y", alpha=0.15)
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=30, fontsize=7.5)
+        ax.set_ylabel(f"{tenor} event vol (%)", fontsize=10)
+        ax.set_title(
+            f"{tenor} — {len(df_iv)} IV-observable OOS meetings  "
+            f"({df_iv['meeting_date'].min().year}–{df_iv['meeting_date'].max().year})",
+            fontsize=10)
+        ax.legend(fontsize=8, loc="upper left", ncol=2)
+        ax.grid(True, axis="y", alpha=0.15)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, fontsize=7.5)
 
     fig.legend(handles=_regime_handles(), fontsize=7.5,
                loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.02))
     fig.tight_layout(rect=[0, 0.04, 1, 1])
-    _save(fig, "vrp_v6_gap_timeseries")
+    _save(fig, "vrp_v6_four_series")
 
 
-fig_v6_gap_timeseries(gaps_2Y, gaps_30Y)
+fig_v6_four_series(hist_2Y, hist_30Y)
 
 # %% [markdown]
 # ---
-# ## Cell 11 — Fig V7: VRP vs Forecast Error Scatter (Regime-Coloured)
+# ## Cell 11 — Fig V7: IV/RV Proximity Scatter + VRP-Error Alignment
 #
-# **Core diagnostic test:** if NLP-only is truly an IV analog, then its
-# forecast error on realized vol (pred_nlp − RV) should equal the VRP
-# (IV − RV) — i.e., the error *is* the VRP.  The scatter should sit on
-# the 45° line.  Deviation from 45° = where NLP-only diverges from IV.
+# **Two tests in one figure:**
+#
+# **Left (scatter, 2×2):** For each OOS meeting with IV:
+# - X-axis = IV; Y-axis = model prediction
+# - If the cloud sits on the 45° line → model ≈ IV
+# - NLP-only cloud should lie ON the IV diagonal
+# - NLP×regime cloud should lie BELOW the IV diagonal (predicts closer to lower RV)
+#
+# **Right (bar chart):** MAE to IV and to RV per regime.
+# Slack/easing should show NLP-only closer to IV; NLP×regime closer to RV.
 
 # %%
-def fig_v7_vrp_vs_error(gaps_2Y: pd.DataFrame, gaps_30Y: pd.DataFrame) -> None:
+def fig_v7_proximity_scatter(hist_2Y: pd.DataFrame, hist_30Y: pd.DataFrame) -> None:
     """
-    Scatter: VRP (x) vs forecast error (y) for both models.
-    45° line = NLP-only perfectly tracks IV.
-    Points clustered BELOW 45° = NLP-only is MORE accurate than IV
-    (model corrects some of the market's overpricing).
+    Row 1 (2Y) / Row 2 (30Y):
+      Left:   Scatter — IV vs pred_nlp and pred_regime (both on one plot, diff markers)
+      Centre: Scatter — RV vs pred_nlp and pred_regime
+      Right:  Bar chart — MAE per regime for NLP-only vs NLP×regime (distance to IV and RV)
     """
-    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
+    fig = plt.figure(figsize=(17, 12))
     fig.suptitle(
-        "Fig V7 — VRP vs Forecast Error: Does NLP Track the Market's Mispricing?\n"
-        "On the 45° line: model error = VRP (model IS the market's implied forecast)\n"
-        "Below 45°: model corrects some VRP; Above: model adds additional error",
+        "Fig V7 — Proximity Test: NLP-only → IV analog · NLP×regime → RV analog\n"
+        "Hypothesis: NLP-only corr(IV)>corr(RV);  NLP×regime corr(RV)>corr(IV)\n"
+        "Data: full-history walk-forward OOS meetings where IV was observable (2012–2020)",
         fontsize=11)
 
-    for row_i, (gaps, tenor) in enumerate([(gaps_2Y, "2Y"), (gaps_30Y, "30Y")]):
-        df_iv = gaps.dropna(subset=["iv", "vrp"])
-        if df_iv.empty:
+    gs = gridspec.GridSpec(2, 3, figure=fig, wspace=0.33, hspace=0.40)
+
+    for row_i, (df, tenor) in enumerate([(hist_2Y, "2Y"), (hist_30Y, "30Y")]):
+        df_iv = df.dropna(subset=["iv"]).copy()
+        if len(df_iv) < 5:
             continue
         cols = [REGIME_PALETTE.get(l, "#878787") for l in df_iv["regime_label"]]
 
-        for col_i, (err_col, title) in enumerate([
-            ("gap_nlp_rv", "NLP-only error vs VRP"),
-            ("gap_reg_rv", "NLP×regime error vs VRP"),
-        ]):
-            ax = axes[row_i][col_i]
-            x  = df_iv["vrp"].values
-            y  = df_iv[err_col].values
+        ax_iv  = fig.add_subplot(gs[row_i, 0])
+        ax_rv  = fig.add_subplot(gs[row_i, 1])
+        ax_bar = fig.add_subplot(gs[row_i, 2])
 
-            ax.scatter(x, y, c=cols, s=40, alpha=0.80,
-                       edgecolors="white", lw=0.3, zorder=3)
+        iv  = df_iv["iv"].values
+        rv  = df_iv["actual"].values
+        pnl = df_iv["pred_nlp"].values
+        prg = df_iv["pred_regime"].values
 
-            # 45° line
-            lim = max(abs(x).max(), abs(y).max()) * 1.1
-            ax.plot([-lim, lim], [-lim, lim], "k--", lw=0.9, alpha=0.5,
-                    label="45° (model = IV analog)")
-            ax.axhline(0, color="grey", lw=0.5, alpha=0.4)
-            ax.axvline(0, color="grey", lw=0.5, alpha=0.4)
-            ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+        # ── Left: pred vs IV ────────────────────────────────────────────────
+        ax_iv.scatter(iv, pnl, c=cols, s=35, marker="o", alpha=0.80,
+                       edgecolors="white", lw=0.3, zorder=3, label="NLP-only")
+        ax_iv.scatter(iv, prg, c=cols, s=35, marker="^", alpha=0.70,
+                       edgecolors="white", lw=0.3, zorder=3, label="NLP×regime")
+        lim_iv = max(iv.max(), max(pnl.max(), prg.max())) * 1.08
+        ax_iv.plot([0, lim_iv], [0, lim_iv], "k--", lw=0.9, alpha=0.5,
+                    label="45° (pred = IV)")
+        r_nlp_iv = float(np.corrcoef(iv, pnl)[0,1])
+        r_reg_iv = float(np.corrcoef(iv, prg)[0,1])
+        ax_iv.set_xlim(0, lim_iv); ax_iv.set_ylim(0, lim_iv)
+        ax_iv.set_xlabel("Implied vol IV (%)", fontsize=9)
+        ax_iv.set_ylabel("Model prediction (%)", fontsize=9)
+        ax_iv.set_title(
+            f"{tenor} — Proximity to IV\n"
+            f"r(NLP,IV)={r_nlp_iv:.2f}  r(Reg,IV)={r_reg_iv:.2f}", fontsize=9)
+        ax_iv.legend(fontsize=7, loc="upper left")
+        ax_iv.grid(True, alpha=0.15, lw=0.5)
 
-            # Correlation and regression
-            if len(x) > 3:
-                slope, intercept, r, p, _ = sp_stats.linregress(x, y)
-                x_line = np.linspace(-lim, lim, 50)
-                ax.plot(x_line, slope * x_line + intercept, color="grey",
-                        lw=1.0, ls="-", alpha=0.5,
-                        label=f"OLS  slope={slope:.2f}  R²={r**2:.2f}")
+        # ── Centre: pred vs RV ──────────────────────────────────────────────
+        ax_rv.scatter(rv, pnl, c=cols, s=35, marker="o", alpha=0.80,
+                       edgecolors="white", lw=0.3, zorder=3, label="NLP-only")
+        ax_rv.scatter(rv, prg, c=cols, s=35, marker="^", alpha=0.70,
+                       edgecolors="white", lw=0.3, zorder=3, label="NLP×regime")
+        lim_rv = max(rv.max(), max(pnl.max(), prg.max())) * 1.08
+        ax_rv.plot([0, lim_rv], [0, lim_rv], "k--", lw=0.9, alpha=0.5,
+                    label="45° (pred = RV)")
+        r_nlp_rv = float(np.corrcoef(rv, pnl)[0,1])
+        r_reg_rv = float(np.corrcoef(rv, prg)[0,1])
+        ax_rv.set_xlim(0, lim_rv); ax_rv.set_ylim(0, lim_rv)
+        ax_rv.set_xlabel("Realized vol RV (%)", fontsize=9)
+        ax_rv.set_ylabel("Model prediction (%)", fontsize=9)
+        ax_rv.set_title(
+            f"{tenor} — Proximity to RV\n"
+            f"r(NLP,RV)={r_nlp_rv:.2f}  r(Reg,RV)={r_reg_rv:.2f}", fontsize=9)
+        ax_rv.legend(fontsize=7, loc="upper left")
+        ax_rv.grid(True, alpha=0.15, lw=0.5)
 
-            ax.set_xlabel("VRP = IV − RV (%)", fontsize=9)
-            ax.set_ylabel(f"{'NLP-only' if col_i==0 else 'NLP×regime'} error: pred − RV (%)",
-                           fontsize=9)
-            ax.set_title(f"{tenor} — {title}\n"
-                          f"(n={len(df_iv)}, all pre-2020 IV-observed meetings)", fontsize=9)
-            ax.legend(fontsize=7.5, loc="upper left")
-            ax.set_aspect("equal", adjustable="box")
-            ax.grid(True, alpha=0.15, lw=0.5)
+        # Highlight claim: NLP-only should be closer to IV diagonal,
+        # NLP×regime should be closer to RV diagonal
+        # Mark the MEAN predictions
+        ax_iv.scatter([iv.mean()], [pnl.mean()], s=160, marker="D",
+                       color="steelblue", zorder=6, edgecolors="black", lw=0.8,
+                       label=f"NLP mean ({pnl.mean():.2f}%)")
+        ax_iv.scatter([iv.mean()], [prg.mean()], s=160, marker="D",
+                       color="#d73027", zorder=6, edgecolors="black", lw=0.8,
+                       label=f"Regime mean ({prg.mean():.2f}%)")
+        ax_iv.axhline(iv.mean(), color="#8e44ad", lw=0.8, ls=":", alpha=0.5)
+        ax_iv.axhline(rv.mean(), color="#333333", lw=0.8, ls=":", alpha=0.5)
+        ax_iv.text(lim_iv * 0.02, iv.mean() + 0.05, f"IV mean={iv.mean():.2f}%",
+                    fontsize=6.5, color="#8e44ad")
+        ax_iv.text(lim_iv * 0.02, rv.mean() - 0.20, f"RV mean={rv.mean():.2f}%",
+                    fontsize=6.5, color="#333333")
+
+        # ── Right: MAE per regime ────────────────────────────────────────────
+        labs  = [l for l in REGIME_ORDER if l in df_iv["regime_label"].values]
+        x_pos = np.arange(len(labs))
+        w     = 0.18
+
+        mae_nlp_iv = [df_iv[df_iv["regime_label"]==l]["gap_nlp_iv"].abs().mean() for l in labs]
+        mae_reg_iv = [df_iv[df_iv["regime_label"]==l]["gap_reg_iv"].abs().mean() for l in labs]
+        mae_nlp_rv = [df_iv[df_iv["regime_label"]==l]["gap_nlp_rv"].abs().mean() for l in labs]
+        mae_reg_rv = [df_iv[df_iv["regime_label"]==l]["gap_reg_rv"].abs().mean() for l in labs]
+
+        ax_bar.bar(x_pos - 1.5*w, mae_nlp_iv, w, color="steelblue",   alpha=0.85,
+                    label="NLP-only MAE vs IV")
+        ax_bar.bar(x_pos - 0.5*w, mae_reg_iv, w, color="#d73027",      alpha=0.55,
+                    label="NLP×regime MAE vs IV")
+        ax_bar.bar(x_pos + 0.5*w, mae_nlp_rv, w, color="steelblue",   alpha=0.45,
+                    hatch="///", linewidth=0, label="NLP-only MAE vs RV")
+        ax_bar.bar(x_pos + 1.5*w, mae_reg_rv, w, color="#d73027",      alpha=0.85,
+                    hatch="///", linewidth=0, label="NLP×regime MAE vs RV")
+
+        ax_bar.set_xticks(x_pos)
+        ax_bar.set_xticklabels([l.replace("_","\n") for l in labs], fontsize=7.5)
+        for tick, lab in zip(ax_bar.get_xticklabels(), labs):
+            tick.set_color(REGIME_PALETTE.get(lab, "black"))
+        ax_bar.set_ylabel("Mean absolute error (%)", fontsize=9)
+        ax_bar.set_title(
+            f"{tenor} — MAE to IV vs RV per regime\n"
+            f"Solid=vs IV · Hatched=vs RV · Blue=NLP-only · Red=NLP×regime",
+            fontsize=8.5)
+        ax_bar.legend(fontsize=6.5, loc="upper right")
+        ax_bar.grid(True, axis="y", alpha=0.18)
+
+        # n per regime
+        for xi, lab in zip(x_pos, labs):
+            n = len(df_iv[df_iv["regime_label"] == lab])
+            ax_bar.text(xi, 0.05, f"n={n}", ha="center", fontsize=6.5, color="grey")
 
     fig.legend(handles=_regime_handles(), fontsize=7.5,
                loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.02))
     fig.tight_layout(rect=[0, 0.04, 1, 1])
-    _save(fig, "vrp_v7_vrp_error_scatter")
+    _save(fig, "vrp_v7_proximity_scatter")
 
 
-fig_v7_vrp_vs_error(gaps_2Y, gaps_30Y)
+fig_v7_proximity_scatter(hist_2Y, hist_30Y)
 print("═" * 64)
