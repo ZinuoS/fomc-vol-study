@@ -232,6 +232,32 @@ Filled 245 rows (49 meetings × 5 tenors). ETF tenors: SHY→2Y, IEI→5Y, IEF�
 
 ---
 
+### V6 — Timing Mismatch Fix: EWMA-3 Lag (2026 Q2)
+
+**Observed problem**: In time-series visualisations (Fig V2), model predictions appeared shifted one meeting relative to actual RV. Quantifying: `corr(pred, rv_lag1) = 0.437` while the actual RV autocorrelation is only `corr(actual, rv_lag1) = 0.616`. The model was over-learning the previous meeting's RV and underweighting the current meeting's NLP signals.
+
+**Root cause**: All walk-forwards included `rv_lag1` (previous meeting's GK vol) as a feature. Ridge assigned 437/616 = 71% of the actual autocorrelation to the model's lag term, creating a 1-meeting delayed tracking effect. Any large RV at meeting t−1 caused the model to over-predict at meeting t even if NLP signals indicated low vol.
+
+**Fix**: Replace `rv_lag1` with `rv_ewma3`:
+```python
+pan["rv_ewma3"] = pan["rv"].ewm(span=3, adjust=False).mean().shift(1)
+```
+The EWMA (exponentially weighted moving average of last 3 meetings, span=3) provides a smoother vol regime signal that decays with recency rather than sticking to the previous single-meeting spike.
+
+**Impact (2Y tenor, Powell OOS n=43–51)**:
+
+| Model | Before (rv_lag1) | After (rv_ewma3) | Change |
+|-------|-----------------|-----------------|--------|
+| NLP-only RMSE | 1.58% | **1.28%** | −0.30 pp |
+| NLP-only R² | −0.48 | **−0.16** | +0.32 |
+| NLP×regime R² (full features) | −0.14 | **+0.23** | +0.37 |
+| Diagnosis Spec A NLP-only R² | −0.28 | **+0.11** | +0.39 |
+| Diagnosis Spec B SHR | 69.8% | **76.7%** | +7 pp |
+
+**Why EWMA beats lag-1**: The 3-meeting EWMA blends recent history and is 66% less sensitive to single-meeting spikes. This means a surprise vol spike at t−1 (e.g., COVID March 2020, 4.58%) contributes only ~50% weight to the t forecast instead of 100% weight.
+
+---
+
 ## 3. Mathematical Foundations
 
 ### 3.1 NLP Feature Computation

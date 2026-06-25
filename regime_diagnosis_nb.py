@@ -158,10 +158,12 @@ def build_panel() -> pd.DataFrame:
     pan = feats.merge(reg, on="meeting_date", how="inner")
     pan["policy_dir"] = pan["policy_dir"].fillna(pan["policy_dir_fred"].fillna(0))
 
-    # Lagged targets (no look-ahead)
+    # Lagged targets (no look-ahead) — EWMA-3 reduces timing lag vs single lag
     pan = pan.sort_values("meeting_date").reset_index(drop=True)
-    pan["rv_2Y_lag1"]  = pan["rv_2Y"].shift(1)
-    pan["rv_30Y_lag1"] = pan["rv_30Y"].shift(1)
+    pan["rv_2Y_lag1"]   = pan["rv_2Y"].shift(1)
+    pan["rv_30Y_lag1"]  = pan["rv_30Y"].shift(1)
+    pan["rv_2Y_ewma3"]  = pan["rv_2Y"].ewm(span=3, adjust=False).mean().shift(1)
+    pan["rv_30Y_ewma3"] = pan["rv_30Y"].ewm(span=3, adjust=False).mean().shift(1)
 
     # Regime one-hots
     for lab in REGIME_ORDER:
@@ -512,10 +514,11 @@ def build_pca_features(panel: pd.DataFrame,
 
 panel_pca = build_pca_features(panel)
 
-# Define feature lists for spec A
-FEATS_A_NLP    = ["pc1"] + [c for c in CTRL_COLS if c in panel_pca.columns]
+# Define feature lists for spec A (rv_2Y_ewma3 replaces rv_2Y_lag1 to reduce timing lag)
+_EWMA_COL = "rv_2Y_ewma3"
+FEATS_A_NLP    = ["pc1"] + [c for c in CTRL_COLS + [_EWMA_COL] if c in panel_pca.columns]
 FEATS_A_REGIME = ["pc1", "inflation_gap", "pc1_x_inf_gap"] + \
-                 [c for c in CTRL_COLS if c in panel_pca.columns]
+                 [c for c in CTRL_COLS + [_EWMA_COL] if c in panel_pca.columns]
 
 res_A = walk_forward(panel_pca, FEATS_A_NLP, FEATS_A_REGIME, "rv_2Y")
 spec_A = report_spec("Spec A — PC1 × inflation_gap (parsimony)", res_A)
@@ -554,9 +557,9 @@ def add_direction_features(panel: pd.DataFrame) -> pd.DataFrame:
 
 panel_dir = add_direction_features(panel_pca.copy())
 
-FEATS_B_NLP    = ["pc1"] + [c for c in CTRL_COLS if c in panel_dir.columns]
+FEATS_B_NLP    = ["pc1"] + [c for c in CTRL_COLS + [_EWMA_COL] if c in panel_dir.columns]
 FEATS_B_REGIME = ["pc1", "accel", "pc1_x_accel", "dist_from_target"] + \
-                 [c for c in CTRL_COLS if c in panel_dir.columns]
+                 [c for c in CTRL_COLS + [_EWMA_COL] if c in panel_dir.columns]
 
 res_B = walk_forward(panel_dir, FEATS_B_NLP, FEATS_B_REGIME, "rv_2Y")
 spec_B = report_spec("Spec B — PC1 × acceleration (direction regime)", res_B)
@@ -850,7 +853,7 @@ if REGIME_WON:
     LOCKED_FEATS_REGIME = FEATS_A_REGIME if "parsimony" in locked_name.lower() else \
                           FEATS_B_REGIME
 else:
-    LOCKED_FEATS_NLP    = [c for c in TEXT_COLS + CTRL_COLS if c in panel.columns]
+    LOCKED_FEATS_NLP    = [c for c in TEXT_COLS + CTRL_COLS + [_EWMA_COL] if c in panel.columns]
     LOCKED_FEATS_REGIME = LOCKED_FEATS_NLP   # same; we'll report NLP-only
 
 print(f"\n  Locked feature set (NLP-only): {LOCKED_FEATS_NLP}")

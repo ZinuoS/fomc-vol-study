@@ -646,10 +646,11 @@ def build_model_panel(meeting_scores: pd.DataFrame,
         print("  [STUB] vrp_panel.parquet not found — synthetic realized vol used")
         print("  Run fomc_vrp_pipeline.py to get real realized vol.")
 
-    # Lagged AR component (no look-ahead)
+    # Lagged AR component (EWMA-3 reduces single-meeting timing lag)
     for col in ["rv_gk_2Y","rv_gk_30Y"]:
         if col in panel.columns:
-            panel[f"{col}_lag1"] = panel[col].shift(1)
+            panel[f"{col}_lag1"]  = panel[col].shift(1)
+            panel[f"{col}_ewma3"] = panel[col].ewm(span=3, adjust=False).mean().shift(1)
 
     panel = panel.sort_values("meeting_date").reset_index(drop=True)
     print(f"\nModel panel: {panel.shape}")
@@ -692,7 +693,7 @@ def walk_forward_powell(panel: pd.DataFrame,
     nlp_feats = [f for f in TEXT_FEATURES if f in powell.columns]
     nlp_feats += [c for c in ["novelty_prev","guidance_change","word_count_zscore"]
                   if c in powell.columns]
-    ctrl_feats = [c for c in [f"{target_col}_lag1","is_presser","is_speech",
+    ctrl_feats = [c for c in [f"{target_col}_ewma3","is_presser","is_speech",
                                "has_presser","has_speech","policy_dir"]
                   if c in powell.columns]
     regime_feats   = [f"regime_{lab}" for lab in REGIME_ORDER if f"regime_{lab}" in powell.columns]

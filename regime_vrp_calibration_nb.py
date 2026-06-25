@@ -158,6 +158,7 @@ def make_tenor_panel(tenor: str) -> pd.DataFrame:
     pan["vrp"]        = pan["iv"] - pan["rv"]     # positive = IV > RV (market overpays)
     pan               = pan.sort_values("meeting_date").reset_index(drop=True)
     pan["rv_lag1"]    = pan["rv"].shift(1)
+    pan["rv_ewma3"]   = pan["rv"].ewm(span=3, adjust=False).mean().shift(1)
     n_tyvix = (pan["iv_source"] == "tyvix").sum() if "iv_source" in pan.columns else pan["iv"].notna().sum()
     n_etf   = (pan["iv_source"] == "etf_proxy").sum() if "iv_source" in pan.columns else 0
     print(f"  {tenor} panel: {len(pan)} meetings  "
@@ -435,7 +436,7 @@ def walk_forward_both(pan: pd.DataFrame,
     Returns df with: meeting_date, regime_label, actual, iv,
                      pred_nlp, pred_regime, err_nlp, err_regime.
     """
-    feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_lag1", "pc1"]
+    feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_ewma3", "pc1"]
                     if c in pan.columns]
     feats_regime = feats_nlp + [c for c in ["inflation_gap", "pc1_x_inf_gap",
                                               "accel", "pc1_x_accel"]
@@ -834,7 +835,7 @@ def warsh_forward_both_modes(pan_2Y: pd.DataFrame, pan_30Y: pd.DataFrame) -> dic
         pan  = build_pca_panel(pan_raw, start=pan_raw["meeting_date"].min())
         pan  = pan.sort_values("meeting_date")
         target = "rv"
-        feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_lag1", "pc1"]
+        feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_ewma3", "pc1"]
                         if c in pan.columns]
         feats_regime = feats_nlp + [c for c in ["inflation_gap", "pc1_x_inf_gap"]
                                      if c in pan.columns]
@@ -1045,7 +1046,7 @@ def walk_forward_iv_era(pan: pd.DataFrame, tenor: str) -> pd.DataFrame:
     Full-history walk-forward from 2010, so OOS covers 2012-2020 where IV exists.
     Returns same columns as walk_forward_both().
     """
-    feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_lag1", "pc1"]
+    feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_ewma3", "pc1"]
                     if c in pan.columns]
     feats_regime = feats_nlp + [c for c in ["inflation_gap", "pc1_x_inf_gap",
                                               "accel", "pc1_x_accel"]
