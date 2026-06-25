@@ -410,8 +410,11 @@ ax2.set_xlim(-1, len(df))
 plt.tight_layout(rect=[0, 0, 1, 1])
 _out = 'spread_model_figs/fig5_signal_summary.png'
 plt.savefig(_out, dpi=150, bbox_inches='tight', facecolor='#fafbfc')
-plt.show()
+plt.close()
 print(f'[VIS] Fig 5 saved → {_out}')
+
+from IPython.display import Image, display as _dimg
+_dimg(Image(_out, width=1050))
 """)
 
 code("""\
