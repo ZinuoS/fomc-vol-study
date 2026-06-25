@@ -1,0 +1,16 @@
+# Cache directories (re-buildable; too large for git)
+fomc_cache/
+etf_cache/
+vrp_cache/*.parquet
+__pycache__/
+*.pyc
+.DS_Store
+
+# Keep processed data outputs (parquets committed separately)
+!fomc_statements.parquet
+!fomc_corpus_expanded.parquet
+!fomc_features.parquet
+!fomc_dual_mandate_regime.parquet
+!fomc_nlp_regime_forecasts.parquet
+!gap_forecasts*.parquet
+!etf_gap_curve.parquet
