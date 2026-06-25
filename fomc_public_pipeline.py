@@ -2030,32 +2030,117 @@ WC_MIN_FONT   = 9
 WC_WIDTH      = 1300
 WC_HEIGHT     = 680
 
-# FOMC boilerplate stripped before analysis
+# ── Stop-word list ────────────────────────────────────────────────────────────
+# Three layers:
+#   A. FOMC boilerplate (institution/process words shared by every doc)
+#   B. English function words not filtered by len>3 alone
+#   C. Transcript-structure noise from presser PDFs (speaker roles, filler)
+#   D. Names — Fed officials, press-corps reporters whose names leak into text_chair
 _WC_STOP: set[str] = {
+    # A. FOMC institution / process boilerplate
     "committee", "federal", "open", "market", "reserve", "board", "bank",
-    "voting", "voted", "members", "meeting", "fomc", "statement",
-    "monetary", "policy", "economic", "economy", "conditions", "inflation",
-    "employment", "labor", "growth", "year", "period", "recent", "continue",
-    "continued", "remains", "remained", "expects", "expected", "determine",
-    "appropriate", "assessed", "current", "levels", "pace", "future",
-    "percent", "basis", "points", "funds", "range", "target", "rate", "rates",
-    "united", "states", "release", "press", "january", "february", "march",
-    "april", "june", "july", "august", "september", "october", "november",
-    "december", "also", "will", "that", "this", "from", "with", "have",
-    "been", "were", "which", "their", "they", "these", "would", "could",
-    "should", "may", "can", "all", "such", "over", "under", "into",
-    "about", "when", "some", "our", "the", "and", "for", "not", "but",
-    "more", "than", "its", "was", "are", "has", "action",
+    "voting", "voted", "vote", "members", "member", "meeting", "fomc",
+    "statement", "monetary", "policy", "economic", "economy", "conditions",
+    "inflation", "employment", "labor", "growth", "year", "years", "period",
+    "recent", "continue", "continued", "continues", "remains", "remained",
+    "remain", "expects", "expected", "expect", "determine", "appropriate",
+    "assessed", "current", "levels", "level", "pace", "future", "percent",
+    "basis", "points", "point", "funds", "range", "target", "rate", "rates",
+    "united", "states", "release", "press", "percent", "percentage",
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    # B. English function words (comprehensive — beyond len>3)
+    "also", "will", "that", "this", "from", "with", "have", "been", "were",
+    "which", "their", "they", "these", "would", "could", "should", "can",
+    "all", "such", "over", "under", "into", "about", "when", "some", "our",
+    "the", "and", "for", "not", "but", "more", "than", "its", "was", "are",
+    "has", "what", "there", "those", "them", "then", "here", "very", "just",
+    "even", "well", "back", "still", "much", "many", "each", "both", "same",
+    "while", "where", "though", "through", "other", "others", "upon", "your",
+    "does", "doing", "been", "being", "having", "said", "says", "saying",
+    "make", "makes", "made", "take", "takes", "took", "come", "came", "came",
+    "give", "gives", "given", "look", "looks", "looked", "looking", "seem",
+    "seems", "seemed", "think", "thinks", "thought", "know", "knew", "known",
+    "want", "wants", "wanted", "need", "needs", "needed", "show", "shows",
+    "since", "after", "before", "again", "once", "only", "most", "part",
+    "down", "long", "like", "last", "right", "good", "time", "going", "work",
+    "first", "next", "high", "case", "left", "away", "back", "course",
+    "really", "thing", "things", "something", "anything", "everything",
+    "actually", "however", "because", "already", "another", "whether",
+    "toward", "across", "without", "within", "between", "among", "beyond",
+    "along", "around", "today", "place", "including", "included", "includes",
+    "mean", "means", "meant", "simply", "basically", "largely", "broadly",
+    "exactly", "certain", "certainly", "particular", "particularly",
+    "number", "sense", "kind", "sort", "ways", "terms", "basis", "form",
+    "rather", "quite", "pretty", "often", "always", "never", "sometimes",
+    # C. Presser PDF transcript structure (headers, page markers, speaker roles)
+    "chair", "chairman", "chairwoman", "conference", "final", "page",
+    "transcript", "question", "questions", "answer", "answers", "welcome",
+    "afternoon", "morning", "evening", "opening", "remarks", "remarks",
+    "opening", "statement", "closing",
+    # D. Names — Fed officials and their common short-forms
+    "powell", "bernanke", "yellen", "warsh", "brainard", "waller",
+    "jefferson", "cook", "kugler", "barr", "daly", "bostic", "goolsbee",
+    "kashkari", "williams", "mester", "bullard", "kaplan", "rosengren",
+    "george", "harker", "barkin", "logan", "collins", "bowman", "clarida",
+    "evans", "fischer", "kohn", "mishkin", "kroszner", "stein", "tarullo",
+    # D. Press-corps reporters whose names appear in transcript text_chair
+    "smith", "liesman", "mckee", "schneider", "timiraos", "guida",
+    "lawrence", "genzer", "marshall", "smialek", "robb", "siegel",
+    "rugaber", "appelbaum", "torres", "derby", "borak",
+    # D. First names of reporters / officials that slip through
+    "michelle", "steve", "michael", "howard", "nick", "victoria", "edward",
+    "nancy", "jeanna", "greg", "rachel", "colby", "christopher", "binyamin",
+    "craig", "donna", "jennifer", "james", "robert", "richard", "john",
+    "thomas", "william", "charles", "george", "david", "mark", "sarah",
+    "thank", "thanks",
+    # marginal generics that survive len>3 but carry no distinctive signal
+    "people", "mentioned", "little", "coming", "different", "seen",
+    "move", "moved", "moving", "might", "going", "gets", "gotten",
+    "months", "important", "matter", "matters", "certain",
 }
+
+# ── Transcript pre-processor: strips PDF header/footer lines before tokenising ─
+# Patterns confirmed from corpus inspection:
+#   Header (every page): "April 27, 2011 Chairman Bernanke's Press Conference FINAL"
+#   Page marker:         "Page 27 of 28"
+#   Reporter sign-off:   "MICHELLE SMITH. Thank you very much."  (ALL CAPS NAME + period)
+#   Greeting/closing:    "Good afternoon.", "Thank you very much."
+_RE_HEADER    = re.compile(
+    r'(?:January|February|March|April|May|June|July|August|September|October|November|December)'
+    r'\s+\d{1,2},?\s+\d{4}[^\n]*Press\s+Conference[^\n]*FINAL[^\n]*',
+    re.IGNORECASE)
+_RE_PAGE      = re.compile(r'\bPage\s+\d+\s+of\s+\d+\b', re.IGNORECASE)
+_RE_REPORTER  = re.compile(r'^[A-Z][A-Z]+(?:[\s\-][A-Z][A-Z]+)*\.\s*(?:.*)?$',
+                            re.MULTILINE)
+_RE_GREETING  = re.compile(
+    r'\bGood\s+(?:afternoon|morning|evening)[,.]?\s*|'
+    r'\bThank\s+you(?:\s+very\s+much)?[,.]?\s*',
+    re.IGNORECASE)
+
+
+def _strip_transcript_artifacts(text: str) -> str:
+    """
+    Remove PDF structural noise from FOMC press conference transcripts before
+    any tokenisation. Safe to apply to statement text too (patterns won't match).
+    """
+    text = _RE_HEADER.sub(" ", text)
+    text = _RE_PAGE.sub(" ", text)
+    text = _RE_REPORTER.sub(" ", text)
+    text = _RE_GREETING.sub(" ", text)
+    return text
+
 
 print("5.0 Config loaded")
 for b, words in LEXICONS.items():
     print(f"  {b:12s}: {len(words):3d} seed words  {BUCKET_COLORS[b]}")
+print(f"  _WC_STOP: {len(_WC_STOP)} entries (boilerplate + function + names + transcript noise)")
 
 # %% ─── 5.1  PREP — Tokenisation, TF-IDF, Frequency Tables ──────────────────
 
 def _clean(text: str) -> str:
-    """Lowercase, strip non-alpha."""
+    """Strip transcript artifacts, lowercase, remove non-alpha."""
+    text = _strip_transcript_artifacts(text)
     return re.sub(r"\s+", " ", re.sub(r"[^a-z\s]", " ", text.lower())).strip()
 
 
