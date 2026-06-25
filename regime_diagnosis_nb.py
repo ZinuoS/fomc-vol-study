@@ -333,8 +333,17 @@ def fig_d1_diagnosis(diag: dict) -> None:
                      f"n={n}", ha="center", fontsize=8)
     ax1.set_ylabel("ΔRMSE = RMSE(NLP-only) − RMSE(regime)\n(positive = regime wins)",
                    fontsize=9)
-    ax1.set_title("Per-regime: small-n cells show noise-fitting\n"
-                  "(slack n=8 gains most; overheating n=37 loses)", fontsize=9)
+    _valid = [(l, d, n) for l, d, n in zip(labs, dr_vals, ns)
+              if not np.isnan(d) and n > 1]
+    if _valid:
+        _best_lbl,  _best_d,  _best_n  = max(_valid, key=lambda x: x[1])
+        _worst_lbl, _worst_d, _worst_n = min(_valid, key=lambda x: x[1])
+        _ax1_title = (f"{_best_lbl} n={_best_n} gains most; "
+                      f"{_worst_lbl} n={_worst_n} loses most")
+    else:
+        _ax1_title = "small-n cells show noise-fitting"
+    ax1.set_title(f"Per-regime: small-n cells show noise-fitting\n({_ax1_title})",
+                  fontsize=9)
     ax1.set_xticklabels([l.replace("_","\n") for l in labs], fontsize=8)
     for tick, lab in zip(ax1.get_xticklabels(), labs):
         tick.set_color(REGIME_PALETTE.get(lab, "black"))
