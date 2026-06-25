@@ -338,6 +338,140 @@ print("Ticket computed - assertions passed.")
 ''')
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CELL 7b — Real Trade Ticket (dealer-confirmation format)
+# ─────────────────────────────────────────────────────────────────────────────
+code('''
+# CELL 7b: Real trade ticket — dealer confirmation layout
+# All values flow from CELL 7 computed variables; nothing re-derived here.
+
+def _row(field, v2, v30, style2="", style30=""):
+    bg2  = f" background:{style2};" if style2 else ""
+    bg30 = f" background:{style30};" if style30 else ""
+    return (
+        f\'<tr style="border-bottom:1px solid #ddd;">\' +
+        f\'<td style="padding:5px 12px;color:#555;font-size:11px;white-space:nowrap;">{field}</td>\' +
+        f\'<td style="padding:5px 14px;text-align:right;font-weight:600;{bg2}">{v2}</td>\' +
+        f\'<td style="padding:5px 14px;text-align:right;font-weight:600;{bg30}">{v30}</td>\' +
+        \'</tr>\'
+    )
+
+def _divider(label=""):
+    txt = f\'<td colspan="3" style="padding:4px 12px;background:#f0f4f8;font-size:10px;font-weight:bold;color:#2c3e50;letter-spacing:.5px;">{label}</td>\'
+    return f\'<tr>{txt}</tr>\'
+
+sign2  = "+" if net_prem >= 0 else ""
+
+rows_html = "".join([
+    _divider("INSTRUMENT"),
+    _row("Contract",         "ZT  (2Y T-Note, CME)",       "WN  (Ultra Bond, CME)"),
+    _row("Option type",      "ATM straddle",                "ATM straddle"),
+    _row("Direction",        "&#x25B2; BUY (long vol)",     "&#x25BC; SELL (short vol)",
+         style2="#e8f0fb", style30="#fef0ee"),
+    _divider("SIZE"),
+    _row("Notional",         f"${N_2Y/1e6:,.1f} M",        f"${N_30Y/1e6:,.0f} M"),
+    _row("Contracts",        f"{ct2:,} &times; ZT",         f"{ct30:,} &times; WN"),
+    _row("Face / contract",  f"${m[\'FACE_ZT\']/1e3:,.0f}k", f"${m[\'FACE_WN\']/1e3:,.0f}k"),
+    _divider("TERMS"),
+    _row("Forward  F",       f"{m[\'F_2Y\']:.3f} pts",      f"{m[\'F_30Y\']:.3f} pts"),
+    _row("Strike   K",       f"{K_2Y:.3f} pts",             f"{K_30Y:.3f} pts"),
+    _row("K (yield approx)", f"{Ky2:.4f}%",                 f"{Ky30:.4f}%"),
+    _row("Fwd yield",        f"{m[\'Y_2Y_FWD_1M\']:.4f}%", f"{m[\'Y_30Y_FWD_1M\']:.4f}%"),
+    _row("Expiry date",      m[\'EXPIRY_DATE\'],              m[\'EXPIRY_DATE\']),
+    _row("T (cal days)",     f"{T_DAYS}d = {T_YR:.5f} yr",  f"{T_DAYS}d"),
+    _divider("PRICING  (source: MARKET implied vol — Group A)"),
+    _row("Normal vol &sigma;<sub>N</sub>",
+         f"{m[\'IMPLIED_VOL_2Y\']:.4f} pts/yr",            f"{m[\'IMPLIED_VOL_30Y\']:.4f} pts/yr"),
+    _row("Yield vol &sigma;<sub>y</sub>",
+         f"{sy2:.1f} bp/yr",                               f"{sy30:.1f} bp/yr"),
+    _row("DV01",             f"${m[\'DV01_2Y\']:.2f}/bp per $1M", f"${m[\'DV01_30Y\']:.2f}/bp per $1M"),
+    _divider("CASHFLOW"),
+    _row("Spot premium",
+         f"<b style=\'color:#c0392b\'>${p2:,.0f} PAY</b>",
+         f"<b style=\'color:#27ae60\'>${p30:,.0f} RECEIVE</b>"),
+    _row("Transaction costs",
+         f"${cost2:,.0f}",                                f"${cost30:,.0f}"),
+    _row("Net all-in cost",
+         f"<b>${p2+cost2:,.0f}</b>",                      f"<b>${p30-cost30:,.0f}</b>"),
+    _divider("GREEKS (dollar)"),
+    _row("Yield-vega $/bp",  f"${yv2:,.0f}",              f"${yv30:,.0f}"),
+    _row("Dollar delta",     f"${dd2:+,.0f}",             f"${dd30:+,.0f}"),
+    _row("Dollar gamma",     f"${gam2:+,.0f}",            f"-${gam30:,.0f}"),
+    _row("Dollar &theta;/day", f"${th2:+,.0f}",           f"${th30:+,.0f}"),
+])
+
+net_vega_flag = "&#x2713; vega-neutral" if abs(net_yv) < 500 else f"${net_yv:+,.0f}/bp  &#x26A0;"
+net_prem_color = "#c0392b" if net_prem > 0 else "#27ae60"
+
+html_ticket = f"""
+<div style="font-family:\'Courier New\',monospace;max-width:740px;border:2.5px solid #1a2035;border-radius:5px;overflow:hidden;font-size:12px;box-shadow:0 3px 10px rgba(0,0,0,.15);">
+
+  <!-- ── header ── -->
+  <div style="background:#1a2035;color:white;padding:10px 18px;display:flex;justify-content:space-between;align-items:center;">
+    <div>
+      <span style="font-size:13.5px;font-weight:bold;letter-spacing:1px;">FOMC VOL STEEPENER</span><br>
+      <span style="font-size:10.5px;color:#aac;letter-spacing:.5px;">TRADE TICKET / CONFIRMATION DRAFT</span>
+    </div>
+    <div style="text-align:right;font-size:10.5px;color:#ccd;">
+      Booked&nbsp;&nbsp;{m[\'ENTRY_DATE\']}<br>
+      FOMC&nbsp;&nbsp;&nbsp;{m[\'FOMC_DATE\']}&nbsp;&nbsp;&nbsp;Expiry&nbsp;{m[\'EXPIRY_DATE\']}
+    </div>
+  </div>
+
+  <!-- ── leg header row ── -->
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr>
+        <th style="width:34%;padding:6px 12px;background:#2c3e50;color:#aac;font-size:10px;text-transform:uppercase;letter-spacing:.5px;">Field</th>
+        <th style="width:33%;padding:6px 14px;background:#1a5f8a;color:#7ecff5;font-size:11px;text-align:right;">
+          &#x25B2; LEG 1 &mdash; BUY<br>
+          <span style="font-size:10px;color:#bde;">Long 2Y Vol (ZT)</span>
+        </th>
+        <th style="width:33%;padding:6px 14px;background:#7a1c2e;color:#f5a67e;font-size:11px;text-align:right;">
+          &#x25BC; LEG 2 &mdash; SELL<br>
+          <span style="font-size:10px;color:#f5c;">Short 30Y Vol (WN)</span>
+        </th>
+      </tr>
+    </thead>
+    <tbody>
+      {rows_html}
+    </tbody>
+  </table>
+
+  <!-- ── net footer ── -->
+  <div style="background:#ecf8f0;border-top:2.5px solid #1a2035;padding:10px 18px;display:grid;grid-template-columns:repeat(2,1fr);gap:8px 24px;">
+    <div>
+      <span style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.5px;">Net Premium (PAY)</span><br>
+      <span style="font-size:15px;font-weight:bold;color:{net_prem_color};">${net_prem:+,.0f}</span>
+    </div>
+    <div>
+      <span style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.5px;">Net Yield-Vega</span><br>
+      <span style="font-size:15px;font-weight:bold;color:#27ae60;">{net_vega_flag}</span>
+    </div>
+    <div>
+      <span style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.5px;">Net Delta (approx)</span><br>
+      <span style="font-size:15px;font-weight:bold;color:#2c3e50;">${net_delta:+,.0f}</span>
+    </div>
+    <div>
+      <span style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.5px;">Net Gamma (book)</span><br>
+      <span style="font-size:15px;font-weight:bold;color:#27ae60;">${net_gam:+,.0f} &#x25B2; long</span>
+    </div>
+  </div>
+
+  <!-- ── source footnote ── -->
+  <div style="background:#f7f9fc;border-top:1px solid #ccd;padding:6px 18px;font-size:9.5px;color:#888;">
+    Premium priced from <b>MARKET</b> implied vol (Group&nbsp;A) via Bachelier normal-vol engine.&nbsp;&nbsp;|&nbsp;&nbsp;
+    MC jump from <b>MODEL</b> event-SD (Group&nbsp;B) &mdash; never conflated.&nbsp;&nbsp;|&nbsp;&nbsp;
+    All levels PLACEHOLDER &mdash; overwrite MARKET dict from live screen before booking.
+  </div>
+
+</div>
+"""
+
+from IPython.display import HTML, display as _dsp
+_dsp(HTML(html_ticket))
+''')
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CELL 8 — Styled ticket DataFrame
 # ─────────────────────────────────────────────────────────────────────────────
 code('''
