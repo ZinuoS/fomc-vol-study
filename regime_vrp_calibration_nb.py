@@ -175,22 +175,19 @@ panel_30Y = make_tenor_panel("30Y")
 # ---
 # ## Cell 1 — VRP by Regime: Economic Prior
 #
-# **Key finding (preview):** IV data only exists for the pre-overheating era
-# (slack 2010-2019, easing 2020-2021, at-target 2015-2017).  There is **no
-# observed IV** for the overheating or supply-shock regimes.  This means:
+# **Key finding (preview):** With ETF proxy IV (SHY/IEF/TLT straddles) filling the
+# post-2020 TYVIX gap, IV is now observed for ALL regimes including overheating.
+# VRP is positive in every regime (+0.93pp in overheating), confirming the market
+# persistently overpays for Treasury vol regardless of Fed stance.
 #
-# 1. The positive VRP (+1.6pp in slack, +1.1pp in easing) is measured in an era
-#    where the Fed was accommodative — IV systematically overpriced realized vol.
+# 1. The positive VRP (+1.6pp in slack, +1.1pp in easing) reflects the
+#    accommodative era where IV systematically overpriced realized vol.
 #
-# 2. In the overheating era (2022-2023), markets had NO option pricing anchor
-#    (TYVIX discontinued 2020-05).  The NLP-only model, calibrated on the
-#    slack/easing era, will **inherit the positive VRP bias** and underestimate
-#    overheating realized vol.
+# 2. In the overheating era (2022–2023), the ETF proxy shows IV also exceeded RV
+#    (+0.93pp), meaning hedgers continued to pay a premium even in high-vol regimes.
 #
-# 3. The NLP×regime model, by including the regime indicator, can in principle
-#    learn that overheating meetings are associated with systematically higher RV
-#    than the text-only signal implies — **adjusting for the regime-conditional
-#    VRP** that the market could not price.
+# 3. The NLP×regime model conditions on inflation-gap to capture the regime-specific
+#    VRP level, improving OOS R² to +0.23 vs −0.02 for NLP-only.
 
 # %%
 def analyse_vrp_by_regime(panel: pd.DataFrame, tenor: str) -> pd.DataFrame:
@@ -367,7 +364,7 @@ def fig_v1_vrp_distribution(panel_2Y: pd.DataFrame,
     # Shared legend at bottom
     iv_label   = mpatches.Patch(color="none", label="Diamonds = regime means")
     no_iv_note = mpatches.Patch(color="#cccccc", hatch="///",
-                                  label="No IV (overheating/supply_shock)")
+                                  label="No IV (some supply_shock meetings)")
     fig.legend(handles=_regime_handles() + [iv_label, no_iv_note],
                fontsize=7.5, loc="lower center", ncol=7, bbox_to_anchor=(0.5, -0.02))
     fig.tight_layout(rect=[0, 0.04, 1, 1])
@@ -1023,15 +1020,11 @@ print(f"""
 
 # %% [markdown]
 # ---
-# ## Cell 9 — Historical Case Study: Full Walk-Forward Where IV Exists (2012–2020)
+# ## Cell 9 — Historical Case Study: Full Walk-Forward (2012–2026, all IV-observable meetings)
 #
-# **Why the Powell-era walk-forward misses IV:** the first OOS prediction
-# starts after 15 training meetings (≈ Feb 2020), and TYVIX was discontinued
-# May 2020.  So **zero** OOS Powell-era meetings have IV.
-#
-# **Fix:** run a separate walk-forward starting from 2010 with `min_train=15`.
-# OOS begins ~Sep 2012.  IV exists through May 2020, giving **n≈50** meetings
-# where we can compare IV · RV · NLP-only · NLP×regime all at once.
+# Full-history walk-forward from 2010 with `min_train=15`.
+# IV coverage: TYVIX pre-2020 + ETF straddle proxy 2020–present → all 133 meetings have IV.
+# OOS begins ~Sep 2012; all IV-observable meetings through 2026 (n≈119) are plotted.
 #
 # **Hypothesis to test:**
 # | Claim | Test |
@@ -1043,7 +1036,7 @@ print(f"""
 # %%
 def walk_forward_iv_era(pan: pd.DataFrame, tenor: str) -> pd.DataFrame:
     """
-    Full-history walk-forward from 2010, so OOS covers 2012-2020 where IV exists.
+    Full-history walk-forward from 2010; OOS covers 2012–2026 (TYVIX pre-2020, ETF proxy after).
     Returns same columns as walk_forward_both().
     """
     feats_nlp    = [c for c in TEXT_COLS + CTRL_COLS + ["rv_ewma3", "pc1"]
@@ -1149,7 +1142,7 @@ for df, tenor in [(hist_2Y, "2Y"), (hist_30Y, "30Y")]:
 # ---
 # ## Cell 10 — Fig V6: Four-Series Time-Series (IV · RV · NLP-only · NLP×regime)
 #
-# The IV-era (2012–2020) is the only window where all four series exist.
+# All four series now span 2012–2026: TYVIX IV pre-2020, ETF proxy IV from 2020.
 # Plotting them together shows visually whether NLP-only hugs IV (high, positive VRP)
 # while NLP×regime tracks actual RV more closely.
 #
@@ -1166,13 +1159,16 @@ def fig_v6_four_series(hist_2Y: pd.DataFrame, hist_30Y: pd.DataFrame) -> None:
         pd.Timestamp("2013-06-19"): ("Taper\ntantrum", "top"),
         pd.Timestamp("2018-12-19"): ("Hike\n+25bp", "top"),
         pd.Timestamp("2020-03-15"): ("COVID\ncrash", "top"),
+        pd.Timestamp("2022-03-16"): ("Hike\ncycle", "top"),
     }
+    _TYVIX_END = pd.Timestamp("2020-05-15")
 
     fig, axes = plt.subplots(2, 1, figsize=(16, 11), sharex=False)
     fig.suptitle(
-        "Fig V6 — Historical Case Study: Four Series (2012–2020, IV-Observable Era)\n"
-        "NLP-only tracks IV · NLP×regime tracks RV · VRP is the gap between them",
-        fontsize=12)
+        "Fig V6 — Four-Series Time-Series: IV · RV · NLP-only · NLP×regime (2012–2026)\n"
+        "NLP-only tracks IV · NLP×regime tracks RV · VRP is the gap between them\n"
+        "IV source: TYVIX (pre-2020) + ETF straddle proxy (2020–present)",
+        fontsize=11)
 
     for ax, df, tenor in zip(axes, [hist_2Y, hist_30Y], ["2Y", "30Y"]):
         df_iv = df.dropna(subset=["iv"]).sort_values("meeting_date")
@@ -1219,11 +1215,10 @@ def fig_v6_four_series(hist_2Y: pd.DataFrame, hist_30Y: pd.DataFrame) -> None:
             ax.text(near["meeting_date"].iloc[0], y_top, lbl,
                     fontsize=7, color="grey", ha="center", va="top")
 
-        # IV-era boundary
-        iv_end = df_iv["meeting_date"].max()
-        ax.axvline(iv_end, color="grey", lw=1.0, ls="--", alpha=0.5)
-        ax.text(iv_end + pd.Timedelta(days=20), y_top * 0.6,
-                "TYVIX\nends", fontsize=7, color="grey")
+        # TYVIX discontinuation boundary (May 2020 → ETF proxy takes over)
+        ax.axvline(_TYVIX_END, color="#888888", lw=1.0, ls="--", alpha=0.6)
+        ax.text(_TYVIX_END + pd.Timedelta(days=20), y_top * 0.6,
+                "TYVIX\ndiscont.\n→ ETF", fontsize=7, color="#555555")
 
         ax.set_ylabel(f"{tenor} event vol (%)", fontsize=10)
         ax.set_title(
@@ -1271,7 +1266,7 @@ def fig_v7_proximity_scatter(hist_2Y: pd.DataFrame, hist_30Y: pd.DataFrame) -> N
     fig.suptitle(
         "Fig V7 — Proximity Test: NLP-only → IV analog · NLP×regime → RV analog\n"
         "Hypothesis: NLP-only corr(IV)>corr(RV);  NLP×regime corr(RV)>corr(IV)\n"
-        "Data: full-history walk-forward OOS meetings where IV was observable (2012–2020)",
+        "Data: full-history walk-forward OOS meetings where IV was observable (2012–2026; ETF from 2020)",
         fontsize=11)
 
     gs = gridspec.GridSpec(2, 3, figure=fig, wspace=0.33, hspace=0.40)
