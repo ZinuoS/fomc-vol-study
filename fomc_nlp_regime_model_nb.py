@@ -482,10 +482,13 @@ def score_document(text: str, meeting_date: pd.Timestamp,
         row = feats_df[feats_df["meeting_date"] == pd.Timestamp(meeting_date)]
         if not row.empty:
             r = row.iloc[0]
+            # guidance_density is the pipeline column; guidance_specificity is our alias
+            guid = float(r.get("guidance_specificity",
+                               r.get("guidance_density", 0)))
             return dict(
                 uncertainty_density  = float(r.get("uncertainty_density", 0)),
                 disagree_density     = float(r.get("disagree_density", 0)),
-                guidance_specificity = float(r.get("guidance_specificity", 0)),
+                guidance_specificity = guid,
                 novelty_prev         = float(r.get("novelty_prev", 0)),
                 guidance_change      = float(r.get("guidance_change", 0)),
                 word_count_zscore    = float(r.get("word_count_zscore", 0)),
@@ -709,8 +712,9 @@ def walk_forward_powell(panel: pd.DataFrame,
             cols = [c for c in feat_list if c in train.columns and train[c].notna().any()]
             if len(cols) < 2:
                 return float(y_tr.mean())
-            X_tr = StandardScaler().fit_transform(train[cols].fillna(0).values)
-            X_te = StandardScaler().fit_transform(test[cols].fillna(0).values)
+            scaler = StandardScaler()
+            X_tr   = scaler.fit_transform(train[cols].fillna(0).values)
+            X_te   = scaler.transform(test[cols].fillna(0).values)
             try:
                 return float(RidgeCV(alphas=ALPHA_RANGE).fit(X_tr, y_tr).predict(X_te)[0])
             except Exception:
@@ -1257,8 +1261,9 @@ def fig6_ablation() -> None:
             te = sub[sub["meeting_date"] == dt]
             if len(tr) < 8 or te.empty: continue
             cols = [c for c in TEXT_FEATURES if c in tr.columns]
-            X_tr = StandardScaler().fit_transform(tr[cols].fillna(0).values)
-            X_te = StandardScaler().fit_transform(te[cols].fillna(0).values)
+            scaler = StandardScaler()
+            X_tr   = scaler.fit_transform(tr[cols].fillna(0).values)
+            X_te   = scaler.transform(te[cols].fillna(0).values)
             try:
                 pred = RidgeCV(alphas=ALPHA_RANGE).fit(X_tr, tr[target].values).predict(X_te)[0]
                 hits.append(int(np.sign(pred - tr[target].mean()) ==
