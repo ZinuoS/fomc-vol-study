@@ -504,9 +504,9 @@ def score_document(text: str, meeting_date: pd.Timestamp,
     _GUID = {"percent","basis","specific","committed","will","path",
               "trajectory","explicit","target","threshold","calendar"}
     return dict(
-        uncertainty_density  = sum(1 for w in words if w in _UNC) / n * 100,
-        disagree_density     = sum(1 for w in words if w in _DIS) / n * 100,
-        guidance_specificity = sum(1 for w in words if w in _GUID) / n * 100,
+        uncertainty_density  = sum(1 for w in words if w in _UNC) / n * 1000,
+        disagree_density     = sum(1 for w in words if w in _DIS) / n * 1000,
+        guidance_specificity = sum(1 for w in words if w in _GUID) / n * 1000,
         novelty_prev=0.0, guidance_change=0.0, word_count_zscore=0.0,
         word_count=float(n),
     )
@@ -522,10 +522,12 @@ def score_corpus(corpus: pd.DataFrame) -> pd.DataFrame:
 
     results = []
     for _, row in corpus.iterrows():
-        scores = score_document(str(row.get("text","")),
-                                row["meeting_date"], feats_df)
+        dt     = row["meeting_date"]
+        has_pc = (feats_df is not None and
+                  not feats_df[feats_df["meeting_date"] == pd.Timestamp(dt)].empty)
+        scores = score_document(str(row.get("text","")), dt, feats_df)
         n_tok  = max(int(row.get("n_tokens", len(str(row.get("text","")).split()))), 1)
-        scale  = n_tok / 1000.0
+        scale  = n_tok / 1000.0 if not has_pc else 1.0   # pre-computed already per-1k
         results.append(dict(
             meeting_date         = row["meeting_date"],
             doc_type             = row.get("doc_type","statement"),
@@ -550,12 +552,13 @@ def score_corpus(corpus: pd.DataFrame) -> pd.DataFrame:
 
 
 def agg_to_meeting(scored: pd.DataFrame) -> pd.DataFrame:
-    """Max across doc_types per meeting (presser > speech > statement priority)."""
+    """Presser > speech > statement priority; fall back to MAX only for missing features."""
     priority = {"presser": 3, "speech": 2, "statement": 1}
     scored   = scored.copy()
     scored["priority"] = scored["doc_type"].map(priority).fillna(1)
     rows = []
     for dt, grp in scored.groupby("meeting_date"):
+        best = grp.sort_values("priority", ascending=False).iloc[0]
         row = dict(
             meeting_date      = dt,
             doc_types_present = ",".join(sorted(grp["doc_type"].unique())),
@@ -565,7 +568,9 @@ def agg_to_meeting(scored: pd.DataFrame) -> pd.DataFrame:
         )
         for feat in TEXT_FEATURES + ["novelty_prev","guidance_change",
                                       "word_count_zscore","n_tokens"]:
-            if feat in grp.columns:
+            if feat in best.index and pd.notna(best[feat]):
+                row[feat] = float(best[feat])
+            elif feat in grp.columns:
                 row[feat] = float(grp[feat].max())
         rows.append(row)
     df = pd.DataFrame(rows).sort_values("meeting_date").reset_index(drop=True)

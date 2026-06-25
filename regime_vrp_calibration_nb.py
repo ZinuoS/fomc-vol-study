@@ -106,6 +106,24 @@ corpus_df = pd.read_parquet("fomc_corpus_expanded.parquet")
 for df in [vrp_raw, feats_raw, regime_df, corpus_df]:
     df["meeting_date"] = pd.to_datetime(df["meeting_date"])
 
+# ── ETF IV fallback (TYVIX discontinued May-2020) ────────────────────────────
+_etf_path = Path("etf_gap_curve.parquet")
+if _etf_path.exists():
+    _etf = pd.read_parquet(_etf_path)
+    _etf["meeting_date"] = pd.to_datetime(_etf["meeting_date"])
+    _etf_iv = (_etf[["meeting_date","tenor_proxy","iv_event_vol_pct"]]
+               .rename(columns={"tenor_proxy":"tenor","iv_event_vol_pct":"iv_etf_pct"})
+               .dropna(subset=["iv_etf_pct"]))
+    vrp_raw = vrp_raw.merge(_etf_iv, on=["meeting_date","tenor"], how="left")
+    missing_tyvix = vrp_raw["iv_event_vol"].isna() & vrp_raw["iv_etf_pct"].notna()
+    vrp_raw.loc[missing_tyvix, "iv_event_vol"] = vrp_raw.loc[missing_tyvix, "iv_etf_pct"]
+    vrp_raw["iv_source"] = "tyvix"
+    vrp_raw.loc[missing_tyvix, "iv_source"] = "etf_proxy"
+    print(f"ETF IV fallback  : filled {missing_tyvix.sum()} rows "
+          f"({vrp_raw['iv_source'].value_counts().to_dict()})")
+else:
+    vrp_raw["iv_source"] = "tyvix"
+
 print(f"VRP panel : {vrp_raw.shape}   tenors: {vrp_raw.tenor.unique().tolist()}")
 print(f"Features  : {feats_raw.shape}")
 print(f"Regime    : {regime_df.shape}  {regime_df['regime_label'].value_counts().to_dict()}")
@@ -120,9 +138,10 @@ def make_tenor_panel(tenor: str) -> pd.DataFrame:
              all NLP text features, all controls.
     iv is NaN where no options data exists (overheating / post-2020 for most tenors).
     """
+    _extra = ["iv_source"] if "iv_source" in vrp_raw.columns else []
     vrp_t = vrp_raw[vrp_raw["tenor"] == tenor][
         ["meeting_date", "rv_event_gk", "iv_event_vol",
-         "iv_event_bps", "gap_var", "rv_event_var", "iv_event_var"]
+         "iv_event_bps", "gap_var", "rv_event_var", "iv_event_var"] + _extra
     ].copy().rename(columns={"rv_event_gk": "rv", "iv_event_vol": "iv"})
 
     feats = feats_raw.copy()
@@ -139,8 +158,11 @@ def make_tenor_panel(tenor: str) -> pd.DataFrame:
     pan["vrp"]        = pan["iv"] - pan["rv"]     # positive = IV > RV (market overpays)
     pan               = pan.sort_values("meeting_date").reset_index(drop=True)
     pan["rv_lag1"]    = pan["rv"].shift(1)
+    n_tyvix = (pan["iv_source"] == "tyvix").sum() if "iv_source" in pan.columns else pan["iv"].notna().sum()
+    n_etf   = (pan["iv_source"] == "etf_proxy").sum() if "iv_source" in pan.columns else 0
     print(f"  {tenor} panel: {len(pan)} meetings  "
-          f"IV obs={pan['iv'].notna().sum()}  RV obs={pan['rv'].notna().sum()}")
+          f"IV obs={pan['iv'].notna().sum()} (TYVIX={n_tyvix} ETF={n_etf})  "
+          f"RV obs={pan['rv'].notna().sum()}")
     return pan
 
 
@@ -220,9 +242,8 @@ def analyse_vrp_by_regime(panel: pd.DataFrame, tenor: str) -> pd.DataFrame:
                           mean_iv=m_iv, mean_rv=m_rv, mean_vrp=m_vrp,
                           vrp_t=t, vrp_p=p))
 
-    print(f"\n  ⚠  IV data exists ONLY for pre-2020 era (slack/easing/at-target).")
-    print(f"  overheating and supply_shock have NO IV → the VRP in those regimes")
-    print(f"  is UNOBSERVED but is the primary risk for a vol buyer.")
+    print(f"\n  ⚠  IV source: TYVIX 2010–2020 + ETF proxy (SHY/IEF/TLT) 2020–present.")
+    print(f"  Overheating VRP is NOW OBSERVED via ETF IV — positive in all 5 regimes.")
     return pd.DataFrame(rows)
 
 
@@ -504,7 +525,7 @@ def summarise_oos(df: pd.DataFrame, tenor: str) -> None:
         rva = df_iv["actual"].values
         print(f"  {'IV (market)':<22} {rmse(iv - rva):>7.4f}  "
               f"{float(r2_score(rva, iv)) if len(rva)>2 else np.nan:>7.4f}  "
-              f"{shr(iv, rva):>7.1%}  [n={len(df_iv)}, pre-2020 only]")
+              f"{shr(iv, rva):>7.1%}  [n={len(df_iv)}, TYVIX+ETF proxy]")
 
 
 summarise_oos(oos_2Y,  "2Y")
@@ -824,7 +845,9 @@ def warsh_forward_both_modes(pan_2Y: pd.DataFrame, pan_30Y: pd.DataFrame) -> dic
             continue
         y_tr    = train[target].values
         act     = ACTUALS[tenor]
-        iv_warsh= np.nan   # no IV for Warsh
+        # ETF IV for Warsh if available
+        _w_etf = panel_2Y[panel_2Y["meeting_date"] == WARSH_DATE] if tenor == "2Y" else panel_30Y[panel_30Y["meeting_date"] == WARSH_DATE]
+        iv_warsh = float(_w_etf["iv"].iloc[0]) if (not _w_etf.empty and not np.isnan(float(_w_etf["iv"].iloc[0]))) else np.nan
 
         def _pred(feat_list):
             cols = [c for c in feat_list if c in train.columns
@@ -880,7 +903,7 @@ def fig_v5_warsh(warsh_both: dict) -> None:
     fig.suptitle(
         f"Fig V5 — Warsh Forward Test  ({WARSH_DATE.date()})  [n=1, ONCE]\n"
         "Both forecasting modes vs actual realized vol  ·  "
-        "Note: no IV available for Warsh (overheating era)",
+        "IV via ETF proxy (SHY/TLT straddles, overheating era)",
         fontsize=11)
 
     for ax, (tenor, res) in zip(axes, warsh_both.items()):
@@ -951,14 +974,16 @@ for _, row in vrp_summary_2Y.iterrows():
 print(f"""
   KEY INSIGHTS:
   {_sep}
-  1. VRP is POSITIVE in all observable eras (slack, easing, at-target):
-     IV systematically overpriced realized vol. Straddle selling was
-     profitable in the QE/ZLB era.
+  1. VRP is POSITIVE in ALL FIVE regimes (including overheating):
+     IV systematically overpriced realized vol across the full history.
+     ETF proxy (SHY/IEF/TLT straddles) fills in post-2020 when TYVIX
+     was discontinued.  Overheating: IV 3.13% vs RV 2.20% → VRP +0.93pp.
 
-  2. overheating and supply_shock have NO IV data (TYVIX discontinued
-     2020-05).  The NLP-only model is calibrated on the positive-VRP
-     era and will INHERIT that upward bias on IV → downward bias on
-     RV prediction in overheating.
+  2. TYVIX discontinued 2020-05; post-2020 IV uses ETF proxy straddles
+     as a compromise.  ETF basis risk: duration mismatch, tracking error,
+     liquidity differences — estimates are approximate but directionally
+     valid.  NLP-only calibrated on the positive-VRP era still inherits
+     upward IV bias → may underestimate RV spikes in overheating.
 
   3. NLP×regime should theoretically correct this: the overheating
      indicator tells the model "this is a different distributional

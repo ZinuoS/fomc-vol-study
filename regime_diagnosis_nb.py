@@ -105,6 +105,22 @@ feats_raw["meeting_date"] = pd.to_datetime(feats_raw["meeting_date"])
 regime_df["meeting_date"] = pd.to_datetime(regime_df["meeting_date"])
 corpus_df["meeting_date"] = pd.to_datetime(corpus_df["meeting_date"])
 
+# ── ETF IV fallback (TYVIX discontinued May-2020) ────────────────────────────
+_etf_path = Path("etf_gap_curve.parquet")
+if _etf_path.exists():
+    _etf = pd.read_parquet(_etf_path)
+    _etf["meeting_date"] = pd.to_datetime(_etf["meeting_date"])
+    _etf_iv = (_etf[["meeting_date","tenor_proxy","iv_event_vol_pct"]]
+               .rename(columns={"tenor_proxy":"tenor","iv_event_vol_pct":"iv_etf_pct"})
+               .dropna(subset=["iv_etf_pct"]))
+    vrp = vrp.merge(_etf_iv, on=["meeting_date","tenor"], how="left")
+    _missing = vrp["iv_event_vol"].isna() & vrp["iv_etf_pct"].notna()
+    vrp.loc[_missing, "iv_event_vol"] = vrp.loc[_missing, "iv_etf_pct"]
+    vrp["iv_source"] = "tyvix"
+    vrp.loc[_missing, "iv_source"] = "etf_proxy"
+    print(f"ETF IV fallback  : filled {_missing.sum()} rows "
+          f"({vrp['iv_source'].value_counts().to_dict()})")
+
 print(f"VRP panel  : {vrp.shape}  tenors={vrp.tenor.unique().tolist()}")
 print(f"Features   : {feats_raw.shape}")
 print(f"Regime     : {regime_df.shape}")
@@ -127,12 +143,15 @@ def build_panel() -> pd.DataFrame:
         columns={"policy_dir": "policy_dir_fred"})
 
     for tenor in ["2Y","30Y"]:
+        _iv_cols = ["iv_event_vol","iv_source"] if "iv_source" in vrp.columns else ["iv_event_vol"]
         sub = vrp[vrp["tenor"] == tenor][
-            ["meeting_date","rv_event_gk","rv_event_var","gap_var"]
+            ["meeting_date","rv_event_gk","rv_event_var","gap_var"] + _iv_cols
         ].rename(columns={
             "rv_event_gk":  f"rv_{tenor}",
             "rv_event_var": f"rv_var_{tenor}",
             "gap_var":      f"gap_var_{tenor}",
+            "iv_event_vol": f"iv_{tenor}",
+            "iv_source":    f"iv_source_{tenor}",
         })
         feats = feats.merge(sub, on="meeting_date", how="left")
 
