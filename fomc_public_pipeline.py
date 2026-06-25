@@ -367,7 +367,32 @@ def build_docs_raw(calendar: pd.DataFrame) -> pd.DataFrame:
     return docs
 
 
-docs_raw = build_docs_raw(calendar_df)
+# Load from expanded parquet if available (PDF quality + text_chair column)
+# Fallback: live scraper (HTML cache). Synced with notebook Cell 6 hand-edit.
+_CORPUS_PATH_1D = Path("fomc_corpus_expanded.parquet")
+if _CORPUS_PATH_1D.exists():
+    _corp1d = pd.read_parquet(_CORPUS_PATH_1D)
+    _keep1d = ["meeting_date", "doc_type", "chair", "text_raw", "text",
+               "n_words", "presser_available"]
+    _stmt1d = _corp1d[_corp1d["doc_type"] == "statement"].copy()
+    _stmt1d["text_raw"]          = _stmt1d["text"]
+    _stmt1d["n_words"]           = _stmt1d["text"].str.split().str.len().fillna(0).astype(int)
+    _stmt1d["presser_available"] = _stmt1d["meeting_date"].isin(
+        _corp1d[_corp1d["doc_type"] == "presser"]["meeting_date"].values)
+    _pres1d = _corp1d[_corp1d["doc_type"] == "presser"].copy()
+    _text_full_col = "text_full" if "text_full" in _pres1d.columns else "text"
+    _pres1d["text"]             = _pres1d[_text_full_col].fillna(_pres1d["text"])
+    _pres1d["text_raw"]         = _pres1d["text"]
+    _pres1d["n_words"]          = _pres1d["text"].str.split().str.len().fillna(0).astype(int)
+    _pres1d["presser_available"] = True
+    docs_raw = pd.concat(
+        [_stmt1d[_keep1d], _pres1d[_keep1d]], ignore_index=True
+    ).sort_values(["meeting_date", "doc_type"]).reset_index(drop=True)
+    docs_raw["meeting_date"] = pd.to_datetime(docs_raw["meeting_date"])
+    print(f"Loaded from fomc_corpus_expanded.parquet: {docs_raw.shape}")
+    print(docs_raw.groupby("doc_type")["meeting_date"].count().to_string())
+else:
+    docs_raw = build_docs_raw(calendar_df)
 
 # %% ── 1e: Drop bad scrapes (JS-wall / redirect pages) ───────────────────────
 # Pages that returned a JS-disabled stub or a nav-only redirect produce very
@@ -1533,11 +1558,25 @@ print("""
 # %% ── Visualisation helpers ──────────────────────────────────────────────────
 
 import matplotlib
-matplotlib.use("Agg")
+try:
+    from IPython import get_ipython as _get_ipy
+    _ipy = _get_ipy()
+    if _ipy is not None:
+        _ipy.run_line_magic("matplotlib", "inline")
+    else:
+        matplotlib.use("Agg")
+except Exception:
+    matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import TwoSlopeNorm
 plt.rcParams.update({"figure.dpi": 120, "figure.facecolor": "white"})
+
+try:
+    from IPython.display import display as _ipy_display
+except ImportError:
+    def _ipy_display(*args, **kwargs): pass  # type: ignore[misc]
 
 VIZ_OUT = Path("fomc_viz")
 VIZ_OUT.mkdir(exist_ok=True)
@@ -1569,7 +1608,8 @@ def _warsh_vlines(ax, df: pd.DataFrame) -> None:
 def savefig(fig: plt.Figure, name: str) -> None:
     path = VIZ_OUT / f"{name}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
-    print(f"  Saved → {path}")
+    print(f"  Saved → {VIZ_OUT.name}/{name}.png")
+    _ipy_display(fig)   # embeds inline in Jupyter; no-op in standalone mode
 
 
 # %% ── Fig 1: Feature timeline ────────────────────────────────────────────────
@@ -2031,10 +2071,20 @@ def _tokenise(text: str, bigrams: bool = True) -> list[str]:
 
 
 def build_chair_corpora(docs_df: pd.DataFrame) -> dict[str, str]:
-    """Concatenate all statement text per chair into one large string."""
-    stmt = docs_df[docs_df["doc_type"] == "statement"]
-    return {c: " ".join(stmt[stmt["chair"] == c]["text"].fillna("").tolist())
-            for c in CHAIRS}
+    """Concatenate statement + presser text per chair (expanded corpus)."""
+    out = {}
+    for c in CHAIRS:
+        chair_docs = docs_df[docs_df["chair"] == c]
+        # Statement text
+        stmt_parts = chair_docs[chair_docs["doc_type"] == "statement"]["text"].fillna("").tolist()
+        # Presser: use text_chair (chair turns only) when available, else full presser text
+        press_col  = "text_chair" if "text_chair" in chair_docs.columns else "text"
+        press_parts = [
+            t for t in chair_docs[chair_docs["doc_type"] == "presser"][press_col].fillna("").tolist()
+            if t.strip()
+        ]
+        out[c] = " ".join(p for p in stmt_parts + press_parts if p.strip())
+    return out
 
 
 def build_freq_tables(corpora: dict[str, str]) -> dict[str, dict[str, float]]:
@@ -2082,7 +2132,36 @@ def classify_word(word: str) -> str:
 
 
 # ── Build everything ──────────────────────────────────────────────────────────
-_wc_docs = build_docs_raw(calendar_df)   # instant — all HTML cached
+# Load from parquet to get text_chair (chair presser turns, cleaner signal).
+# Fallback: scraper cache (still has both doc types, just no text_chair).
+# Presser rows in the parquet have chair=None — fill from calendar_df by meeting_date.
+_WC_CORPUS_PATH = Path("fomc_corpus_expanded.parquet")
+if _WC_CORPUS_PATH.exists():
+    _wc_corp = pd.read_parquet(_WC_CORPUS_PATH)
+    _wc_corp["meeting_date"] = pd.to_datetime(_wc_corp["meeting_date"])
+    # Presser rows have chair=None — backfill from calendar
+    _cal_chair = calendar_df[["meeting_date", "chair"]].copy()
+    _cal_chair["meeting_date"] = pd.to_datetime(_cal_chair["meeting_date"])
+    _null_chair = _wc_corp["chair"].isna()
+    if _null_chair.any():
+        _wc_corp = _wc_corp.merge(_cal_chair.rename(columns={"chair": "_chair_fill"}),
+                                  on="meeting_date", how="left")
+        _wc_corp.loc[_null_chair, "chair"] = _wc_corp.loc[_null_chair, "_chair_fill"]
+        _wc_corp.drop(columns=["_chair_fill"], inplace=True)
+    _wc_docs = _wc_corp.copy()
+else:
+    _wc_docs = build_docs_raw(calendar_df)
+
+# ── STALE-DATA GUARD — fails loudly if corpus is statement-only ───────────────
+_EXPECTED_MIN_DOCS = 200
+assert set(_wc_docs["doc_type"].unique()) >= {"statement", "presser"}, (
+    f"VIZ DATA STALE: only {_wc_docs['doc_type'].unique().tolist()} found — "
+    f"rebuild fomc_corpus_expanded.parquet first")
+assert len(_wc_docs) >= _EXPECTED_MIN_DOCS, (
+    f"row count {len(_wc_docs)} < {_EXPECTED_MIN_DOCS} — stale or incomplete corpus")
+print(f"Corpus guard OK: {len(_wc_docs)} docs  "
+      f"{dict(_wc_docs['doc_type'].value_counts())}  "
+      f"{_wc_docs['meeting_date'].min().date()} → {_wc_docs['meeting_date'].max().date()}")
 
 chair_corpora = build_chair_corpora(_wc_docs)
 freq_tables   = build_freq_tables(chair_corpora)
@@ -2090,9 +2169,55 @@ tfidf_scores  = build_tfidf_scores(chair_corpora)
 
 print("\n5.1 Prep complete")
 for c in CHAIRS:
-    n  = len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == c)])
-    nw = len(freq_tables[c])
-    print(f"  {c:12s}: {n:3d} statements  {nw:5d} unique tokens")
+    n_s = len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == c)])
+    n_p = len(_wc_docs[(_wc_docs["doc_type"] == "presser")   & (_wc_docs["chair"] == c)])
+    nw  = len(freq_tables[c])
+    print(f"  {c:12s}: {n_s:3d} stmt + {n_p:2d} pressers  {nw:5d} unique tokens")
+
+# %% ─── 5.1b  COVERAGE FIGURE — proves expanded corpus at a glance ────────────
+
+def plot_doc_coverage(docs_df: pd.DataFrame) -> plt.Figure:
+    """Bar chart: meetings per year per doc_type. First thing to see — proves corpus."""
+    df = docs_df.copy()
+    df["year"] = pd.to_datetime(df["meeting_date"]).dt.year
+    pivot = df.groupby(["year", "doc_type"]).size().unstack(fill_value=0)
+
+    _TYPE_COLORS = {"statement": "#2980b9", "presser": "#e67e22", "speech": "#27ae60"}
+    fig, ax = plt.subplots(figsize=(14, 5))
+    bottom = np.zeros(len(pivot))
+    for col in pivot.columns:
+        ax.bar(pivot.index, pivot[col], bottom=bottom,
+               color=_TYPE_COLORS.get(col, "#95a5a6"), label=col, alpha=0.88,
+               edgecolor="white", linewidth=0.7)
+        for xi, (v, b) in enumerate(zip(pivot[col], bottom)):
+            if v > 0:
+                ax.text(pivot.index[xi], b + v / 2, str(int(v)),
+                        ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+        bottom += pivot[col].values
+
+    by_type = dict(df["doc_type"].value_counts())
+    ax.set_xlabel("Year", fontsize=11)
+    ax.set_ylabel("Documents", fontsize=11)
+    ax.set_xticks(sorted(df["year"].unique()))
+    ax.set_xticklabels([str(y) for y in sorted(df["year"].unique())], rotation=45, ha="right")
+    ax.legend(title="doc_type", fontsize=10, title_fontsize=10)
+    ax.grid(axis="y", lw=0.4, alpha=0.4)
+    ax.set_title(
+        f"FOMC Corpus Coverage — {len(docs_df)} docs  ·  {by_type}\n"
+        f"Date range: {docs_df['meeting_date'].min().date()} → {docs_df['meeting_date'].max().date()}",
+        fontsize=12, fontweight="bold"
+    )
+    fig.tight_layout()
+    savefig(fig, "fig7_corpus_coverage")
+    return fig
+
+
+fig7_cov = plot_doc_coverage(_wc_docs)
+plt.show()
+print(f"\nProvenance fig7_corpus_coverage: _wc_docs  "
+      f"rows={len(_wc_docs)}  "
+      f"types={dict(_wc_docs['doc_type'].value_counts())}  "
+      f"dates={_wc_docs['meeting_date'].min().date()}→{_wc_docs['meeting_date'].max().date()}")
 
 # %% ─── 5.2  COLOUR FUNCTIONS (category | gradient | vol) ────────────────────
 
@@ -2183,7 +2308,8 @@ def plot_small_multiples(tfidf_scores: dict, freq_tables: dict,
     axes_flat = axes.flatten()
 
     for ax, chair in zip(axes_flat, CHAIRS):
-        n   = len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == chair)])
+        n_s = len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == chair)])
+        n_p = len(_wc_docs[(_wc_docs["doc_type"] == "presser")   & (_wc_docs["chair"] == chair)])
         wts = weights.get(chair, {})
         wc  = _make_wc(wts, color_func, shared_max=global_max)
 
@@ -2194,9 +2320,10 @@ def plot_small_multiples(tfidf_scores: dict, freq_tables: dict,
             continue
 
         ax.imshow(wc, interpolation="bilinear")
-        sizing = "TF-IDF" if tfidf else "frequency"
+        sizing  = "TF-IDF" if tfidf else "frequency"
+        n_label = f"{n_s} stmt + {n_p} pressers" if n_p > 0 else f"{n_s} statements"
         ax.set_title(
-            f"{chair}   ·   {n} statement{'s' if n != 1 else ''}"
+            f"{chair}   ·   {n_label}"
             f"   [{sizing} · {mode} colours]",
             fontsize=13, fontweight="bold",
             color=_CHAIR_COLORS.get(chair, "#222222"), pad=10,
@@ -2220,6 +2347,9 @@ def plot_small_multiples(tfidf_scores: dict, freq_tables: dict,
 
 fig7a = plot_small_multiples(tfidf_scores, freq_tables, mode="category", tfidf=True)
 plt.show()
+print(f"Provenance fig7a: _wc_docs  rows={len(_wc_docs)}  "
+      f"types={dict(_wc_docs['doc_type'].value_counts())}  "
+      f"dates={_wc_docs['meeting_date'].min().date()}→{_wc_docs['meeting_date'].max().date()}")
 
 # %% ─── 5.3B  LAYOUT B — POWELL vs WARSH COMPARISON CLOUD ───────────────────
 
@@ -2248,12 +2378,17 @@ def plot_comparison_cloud(freq_tables: dict,
 
     fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(22, 9),
                                        gridspec_kw={"wspace": 0.06})
-    n_a = len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==chair_a)])
-    n_b = len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==chair_b)])
+    def _chair_label(ch: str) -> str:
+        n_s = len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==ch)])
+        n_p = len(_wc_docs[(_wc_docs["doc_type"]=="presser")   & (_wc_docs["chair"]==ch)])
+        return f"{n_s} stmt + {n_p} pressers" if n_p > 0 else f"{n_s} statements"
 
-    for ax, chair, diffs, n, subtitle in [
-        (ax_a, chair_a, diff_a, n_a, f"← words MORE frequent under {chair_a}"),
-        (ax_b, chair_b, diff_b, n_b, f"words MORE frequent under {chair_b} →"),
+    n_a = len(_wc_docs[(_wc_docs["chair"]==chair_a)])
+    n_b = len(_wc_docs[(_wc_docs["chair"]==chair_b)])
+
+    for ax, chair, diffs, subtitle in [
+        (ax_a, chair_a, diff_a, f"← words MORE frequent under {chair_a}"),
+        (ax_b, chair_b, diff_b, f"words MORE frequent under {chair_b} →"),
     ]:
         wc = _make_wc(diffs, color_func, shared_max=shared_max)
         if wc:
@@ -2263,7 +2398,7 @@ def plot_comparison_cloud(freq_tables: dict,
                     ha="center", va="center", fontsize=13, transform=ax.transAxes,
                     color="#888888")
         ax.set_title(
-            f"{chair}  ·  {n} statement{'s' if n != 1 else ''}\n{subtitle}",
+            f"{chair}  ·  {_chair_label(chair)}\n{subtitle}",
             fontsize=12, fontweight="bold",
             color=_CHAIR_COLORS.get(chair, "#333"), pad=10,
         )
@@ -2279,7 +2414,8 @@ def plot_comparison_cloud(freq_tables: dict,
     fig.legend(handles=handles, loc="lower center", ncol=5, fontsize=10,
                frameon=True, bbox_to_anchor=(0.5, 0.0))
 
-    caveat = (f"⚠ {chair_b} has only {n_b} statement(s) — "
+    n_b_stmt = len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==chair_b)])
+    caveat = (f"⚠ {chair_b} has only {n_b_stmt} statement(s) — "
               "differences may reflect sampling, not policy style")
     fig.suptitle(
         f"{chair_a} vs {chair_b} — Distinctive Vocabulary\n"
@@ -2292,6 +2428,8 @@ def plot_comparison_cloud(freq_tables: dict,
 
 fig7b = plot_comparison_cloud(freq_tables, "Powell", "Warsh")
 plt.show()
+print(f"Provenance fig7b: _wc_docs  rows={len(_wc_docs)}  "
+      f"types={dict(_wc_docs['doc_type'].value_counts())}")
 
 # %% ─── 5.3C  LAYOUT C — BUCKET-MIX BARS (quantitative anchor) ──────────────
 
@@ -2333,19 +2471,23 @@ def plot_bucket_bars(freq_tables: dict) -> plt.Figure:
                         color="white" if bucket != "neutral" else "#555")
         left += vals
 
-    n_stmts = [
-        len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==c)])
-        for c in CHAIRS
-    ]
+    n_docs = [len(_wc_docs[_wc_docs["chair"] == c]) for c in CHAIRS]
+    n_stmt = [len(_wc_docs[(_wc_docs["doc_type"]=="statement") & (_wc_docs["chair"]==c)])
+              for c in CHAIRS]
+    n_pres = [len(_wc_docs[(_wc_docs["doc_type"]=="presser")   & (_wc_docs["chair"]==c)])
+              for c in CHAIRS]
     ax.set_yticks(y_pos)
-    ax.set_yticklabels([f"{c}  (n={n})" for c, n in zip(CHAIRS, n_stmts)], fontsize=12)
+    ax.set_yticklabels(
+        [f"{c}  ({ns}s+{np_}p)" for c, ns, np_ in zip(CHAIRS, n_stmt, n_pres)],
+        fontsize=12)
     ax.set_xlabel("Share of word-mass by semantic bucket", fontsize=11)
     ax.set_xlim(0, 1)
     ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
     ax.set_title(
         "Bucket-Mix Bars — Quantitative Anchor for Word Clouds\n"
-        "⚠ Word clouds are illustrative; these bars are the rigorous backing",
-        fontsize=12, fontweight="bold",
+        f"Corpus: {len(_wc_docs)} docs  ·  {dict(_wc_docs['doc_type'].value_counts())}  "
+        "·  ⚠ Word clouds are illustrative; these bars are the rigorous backing",
+        fontsize=11, fontweight="bold",
     )
     ax.legend(loc="lower right", fontsize=10,
               title="Semantic bucket", title_fontsize=10)
@@ -2358,6 +2500,8 @@ def plot_bucket_bars(freq_tables: dict) -> plt.Figure:
 
 fig7c = plot_bucket_bars(freq_tables)
 plt.show()
+print(f"Provenance fig7c: _wc_docs  rows={len(_wc_docs)}  "
+      f"types={dict(_wc_docs['doc_type'].value_counts())}")
 
 # %% ─── 5.3D  LAYOUT D — INTERACTIVE HTML TABLE (optional) ───────────────────
 
@@ -2477,8 +2621,12 @@ def warsh_readout(freq_tables: dict, tfidf_scores: dict,
     corpus size, bucket-mix, and most distinctive TF-IDF words.
     Concludes with a plain-language thesis check.
     """
-    n_by_chair = {
+    n_stmt_by_chair = {
         c: len(_wc_docs[(_wc_docs["doc_type"] == "statement") & (_wc_docs["chair"] == c)])
+        for c in CHAIRS
+    }
+    n_pres_by_chair = {
+        c: len(_wc_docs[(_wc_docs["doc_type"] == "presser")   & (_wc_docs["chair"] == c)])
         for c in CHAIRS
     }
     mixes   = {c: compute_bucket_mix(freq_tables[c]) for c in CHAIRS}
@@ -2495,7 +2643,8 @@ def warsh_readout(freq_tables: dict, tfidf_scores: dict,
     for c in CHAIRS:
         marker = " ◄ Warsh" if c == chair_b else ""
         nw     = len(freq_tables.get(c, {}))
-        print(f"     {c:12s}: {n_by_chair[c]:3d} statements  {nw:5d} unique tokens{marker}")
+        print(f"     {c:12s}: {n_stmt_by_chair[c]:3d} stmt + {n_pres_by_chair[c]:2d} pressers  "
+              f"{nw:5d} unique tokens{marker}")
 
     # 2. Bucket-mix table
     print("\n  2. BUCKET-MIX  (% word-mass in each bucket)")
@@ -2524,21 +2673,22 @@ def warsh_readout(freq_tables: dict, tfidf_scores: dict,
     # 4. Thesis check
     warsh_mix  = mixes[chair_b]
     others_avg = {b: np.mean([mixes[c][b] for c in others]) for b in buckets}
-    sparser    = n_by_chair[chair_b] < np.mean([n_by_chair[c] for c in others])
+    n_docs_by_chair = {c: len(_wc_docs[_wc_docs["chair"] == c]) for c in CHAIRS}
+    sparser    = n_docs_by_chair[chair_b] < np.mean([n_docs_by_chair[c] for c in others])
     more_unc   = warsh_mix["uncertainty"]  > others_avg["uncertainty"]
     less_guid  = warsh_mix["guidance"]     < others_avg["guidance"]
     verdict    = "CONSISTENT" if (more_unc or less_guid) else "NOT YET SUPPORTED"
 
     print("\n  4. THESIS CHECK")
-    print(f"     Cloud sparser (fewer statements)?  {'YES' if sparser else 'NO '}"
-          f"  Warsh={n_by_chair[chair_b]}  others_avg="
-          f"{np.mean([n_by_chair[c] for c in others]):.1f}")
+    print(f"     Cloud sparser (fewer docs)?        {'YES' if sparser else 'NO '}"
+          f"  Warsh={n_docs_by_chair[chair_b]}  others_avg="
+          f"{np.mean([n_docs_by_chair[c] for c in others]):.1f}")
     print(f"     Higher uncertainty word-mass?      {'YES ◄' if more_unc else 'NO  '}"
           f"  Warsh={warsh_mix['uncertainty']:.1%}  others_avg={others_avg['uncertainty']:.1%}")
     print(f"     Lower guidance word-mass?          {'YES ◄' if less_guid else 'NO  '}"
           f"  Warsh={warsh_mix['guidance']:.1%}  others_avg={others_avg['guidance']:.1%}")
     print(f"\n     Verdict: cloud pattern is {verdict} with the vol-through-text thesis.")
-    print(f"\n  ⚠  Caveat: Warsh has {n_by_chair[chair_b]} statement(s).")
+    print(f"\n  ⚠  Caveat: Warsh has {n_docs_by_chair[chair_b]} doc(s) (stmt+presser).")
     print("     Word clouds are illustrative; bucket-mix bars + Layer 4 regressions")
     print("     are the rigorous statistical backing.")
     print("═" * 68)
@@ -2591,9 +2741,18 @@ def _build_word_vol_matrix(docs_df: pd.DataFrame,
     chairs      : Series aligned to rows
     vectorizer  : fitted TfidfVectorizer
     """
-    stmt = (docs_df[docs_df["doc_type"] == "statement"][["meeting_date", "text"]]
-            .copy())
-    stmt["meeting_date"] = pd.to_datetime(stmt["meeting_date"])
+    # Combine statement text + presser text (chair turns only if available) per meeting
+    _press_col = "text_chair" if "text_chair" in docs_df.columns else "text"
+    _stmt_t  = (docs_df[docs_df["doc_type"] == "statement"][["meeting_date", "text"]]
+                .copy().rename(columns={"text": "_stmt_text"}))
+    _stmt_t["meeting_date"] = pd.to_datetime(_stmt_t["meeting_date"])
+    _press_t = (docs_df[docs_df["doc_type"] == "presser"][["meeting_date", _press_col]]
+                .copy().rename(columns={_press_col: "_press_text"}))
+    _press_t["meeting_date"] = pd.to_datetime(_press_t["meeting_date"])
+    _combined = _stmt_t.merge(_press_t, on="meeting_date", how="left")
+    _combined["text"] = (_combined["_stmt_text"].fillna("") + " " +
+                         _combined["_press_text"].fillna("")).str.strip()
+    stmt = _combined[["meeting_date", "text"]].copy()
 
     m = master_df[["meeting_date", "chair"] + _VOL_TARGETS].copy()
     m["meeting_date"] = pd.to_datetime(m["meeting_date"])
@@ -2651,6 +2810,9 @@ vol_warsh    = vol_df[_warsh_mask]
 
 print(f"Matrix: {X_df.shape}  vocab  |  historical={_hist_mask.sum()}  warsh={_warsh_mask.sum()}")
 print(f"Vol targets: {_VOL_TARGETS}")
+print(f"Provenance fig8a/8b: _wc_docs  rows={len(_wc_docs)}  "
+      f"types={dict(_wc_docs['doc_type'].value_counts())}  "
+      f"(statement+presser combined per meeting → {X_df.shape[0]} meeting rows)")
 
 # %% ── 7.1  Fig 8a — Top-40 word–vol correlations ────────────────────────────
 
